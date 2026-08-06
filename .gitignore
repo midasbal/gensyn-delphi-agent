@@ -1,0 +1,27 @@
+# ── Secrets — never commit. Treat git history as public from commit one. ────
+.env
+.env.*.local
+*.pem
+*.key
+
+# ── Dependencies / build artifacts ───────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Runtime logs ──────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Installed skills (third-party — reinstallable via `npx skills add ...`,
+#    not our source). Also removes their bundled .md files (README.md,
+#    SKILL.md, reference/*.md, etc.) from consideration before the repo-root
+#    .md rule below even applies. ────────────────────────────────────────────
+.agents/
+.claude/
+
+# ── Project docs: README.md is tracked, every other root-level .md is not
+#    (ARCHITECTURE.md, STRATEGY.md, RULES.md). Anchored to the repo root
+#    (leading "/") so this never reaches into node_modules/ or the skill
+#    directories above — both already fully ignored regardless. ────────────
+/*.md
+!/README.md

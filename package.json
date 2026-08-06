@@ -1,0 +1,30 @@
+{
+  "name": "delphi-agent",
+  "version": "1.0.0",
+  "description": "Autonomous trading agent for the Gensyn Delphi Agent Arena competition",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "healthcheck": "tsx scripts/healthcheck.ts",
+    "print-markets": "tsx scripts/print-markets.ts",
+    "print-signals": "tsx scripts/print-signals.ts",
+    "demo-crypto-adapter": "tsx scripts/demo-crypto-adapter.ts",
+    "paper-run": "tsx scripts/paper-run.ts",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.9",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@gensyn-ai/gensyn-delphi-sdk": "^2.1.0",
+    "dotenv": "^17.4.2"
+  }
+}
