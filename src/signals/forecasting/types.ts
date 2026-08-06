@@ -16,4 +16,9 @@ export interface ForecastResult {
   outcomes: OutcomeEstimate[];
   rationale: string;
   sourcesUsed: string[];
+  /** Reference-class base rate the model started from, before case-specific adjustment. */
+  baseRate?: number;
+  keyDrivers?: string[];
+  resolutionRisk?: string;
+  evidenceQuality?: "strong" | "moderate" | "thin" | "none";
 }

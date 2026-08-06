@@ -86,7 +86,7 @@ async function fetchWithBackoff(url: string, init: RequestInit): Promise<Respons
   return null;
 }
 
-async function callAnthropic(system: string, user: string): Promise<string | null> {
+async function callAnthropic(system: string, user: string, temperature?: number): Promise<string | null> {
   const res = await fetchWithBackoff("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -94,7 +94,13 @@ async function callAnthropic(system: string, user: string): Promise<string | nul
       "x-api-key": signals.anthropicApiKey!,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({ model: signals.llmModel, max_tokens: 1024, system, messages: [{ role: "user", content: user }] }),
+    body: JSON.stringify({
+      model: signals.llmModel,
+      max_tokens: 1024,
+      system,
+      messages: [{ role: "user", content: user }],
+      ...(temperature !== undefined ? { temperature } : {}),
+    }),
   });
   if (!res) {
     lastCallStatus = "error";
@@ -115,7 +121,7 @@ async function callAnthropic(system: string, user: string): Promise<string | nul
 }
 
 /** Shared by Groq and the generic openai-compatible provider — both speak the OpenAI chat-completions shape. */
-async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: string, user: string): Promise<string | null> {
+async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: string, user: string, temperature?: number): Promise<string | null> {
   const res = await fetchWithBackoff(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
@@ -129,6 +135,7 @@ async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: str
         { role: "system", content: system },
         { role: "user", content: user },
       ],
+      ...(temperature !== undefined ? { temperature } : {}),
     }),
   });
   if (!res) {
@@ -148,19 +155,20 @@ async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: str
   return data.choices?.[0]?.message?.content ?? null;
 }
 
-export async function callLLM(system: string, user: string): Promise<string | null> {
+export async function callLLM(system: string, user: string, opts?: { temperature?: number }): Promise<string | null> {
   if (!isLLMConfigured()) {
     lastCallStatus = "unconfigured";
     return null;
   }
 
+  const temperature = opts?.temperature;
   switch (signals.llmProvider) {
     case "groq":
-      return callOpenAiCompatible("https://api.groq.com/openai/v1", signals.groqApiKey!, system, user);
+      return callOpenAiCompatible("https://api.groq.com/openai/v1", signals.groqApiKey!, system, user, temperature);
     case "anthropic":
-      return callAnthropic(system, user);
+      return callAnthropic(system, user, temperature);
     case "openai-compatible":
-      return callOpenAiCompatible(signals.openaiCompatibleBaseUrl!, signals.openaiCompatibleApiKey!, system, user);
+      return callOpenAiCompatible(signals.openaiCompatibleBaseUrl!, signals.openaiCompatibleApiKey!, system, user, temperature);
   }
 }
 

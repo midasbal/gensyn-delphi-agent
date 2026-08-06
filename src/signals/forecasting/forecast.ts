@@ -1,24 +1,29 @@
 /**
  * LLM-based forecasting for markets with no confident (high-quality)
- * consensus reference. Base-rate-first: the prompt explicitly asks the model
- * to anchor on a base rate before adjusting for specifics, and to use
- * retrieved search snippets (if any) over its own training knowledge for
- * anything time-sensitive.
+ * consensus reference. Prompt is a calibration-first forecaster: base rate
+ * before adjustment, evidence-weighted, explicitly forecasting the
+ * STRUCTURED resolution criteria (not a loose reading of the question), and
+ * never anchored on the market price.
  *
  * Returns null — not a fabricated guess — when the LLM is unconfigured, the
- * call/parse fails, OR the provider is rate-limited even after backoff
- * (llmClient.ts retries 429s internally; a persistent 429 here means "defer
- * this market to the next pass", which is exactly what returning null and
- * letting the loop move on already does — no special-casing needed at this
- * layer, but see getLastLLMCallStatus() for reporting which case happened).
+ * call/parse fails twice in a row, or the provider is rate-limited even
+ * after backoff (llmClient.ts retries 429s internally; a persistent 429
+ * here means "defer this market to the next pass" — returning null and
+ * letting the loop move on already does that, no special-casing needed, but
+ * see getLastForecastStatus() for reporting which case happened).
+ *
+ * Malformed JSON gets exactly ONE retry (a fresh LLM call, not a re-parse of
+ * the same text) before giving up — never a guess past that.
  *
  * Caches by a hash of the inputs that would actually change the answer
  * (question, outcomes, resolvesAt, structured fields) so a market whose
  * inputs haven't changed since the last pass is NOT re-forecast — this
  * matters a lot against Groq's free-tier rate limits (30 req/min).
  *
- * Asks for a probability per outcome (not just outcomes[0]) so this works
- * for N-outcome markets, not just binary — see signals/types.ts.
+ * Per-outcome nulls are allowed by the prompt contract (the model may only
+ * be able to estimate some outcomes) — that maps directly onto
+ * signals/types.ts's OutcomeEstimate, which was already designed to allow a
+ * partial per-outcome distribution.
  */
 import type { NormalizedMarket } from "../../markets/types.js";
 import type { StructuredResolution, ForecastResult } from "./types.js";
@@ -26,18 +31,118 @@ import type { OutcomeEstimate } from "../types.js";
 import { isLLMConfigured, callLLM, extractJson, getLastLLMCallStatus, type LLMCallStatus } from "./llmClient.js";
 import { isSearchConfigured, search } from "./searchProvider.js";
 
-const SYSTEM_PROMPT = `You are forecasting probabilities for a prediction-market's outcomes.
-Reason base-rate first: start from the historical base rate for this class of event, then adjust for the specifics given. Prefer any provided search snippets over your own training knowledge for anything time-sensitive — your training data may be stale.
-Respond with ONLY a JSON object:
-{
-  "probabilities": [<number 0-1 for outcomes[0]>, <number 0-1 for outcomes[1]>, ...],
-  "confidence": <number 0-1, your overall confidence in this distribution>,
-  "rationale": "<2-4 sentences: base rate, then adjustment, then any search evidence used>"
-}
-The probabilities array MUST have exactly one entry per outcome, in the given order, and MUST sum to approximately 1.
-Do not include any text outside the JSON object.`;
-
+const TEMPERATURE = 0.2;
 const SUM_TOLERANCE = 0.05;
+const MALFORMED_JSON_RETRIES = 1;
+
+const SYSTEM_PROMPT = `You are a calibrated forecasting engine for prediction markets. Your only job is
+to estimate the true probability of each outcome as accurately and honestly as
+possible. You are scored on CALIBRATION: when you say 70%, it should happen about
+70% of the time. Overconfidence is the cardinal sin. If you lack evidence, report
+low confidence rather than inventing a confident number.
+
+Method, in this order:
+1. Identify the reference class and its base rate BEFORE looking at case
+   specifics. State the base rate you start from.
+2. Adjust from that base rate using only the case-specific evidence provided.
+   Move only as far as the evidence justifies.
+3. Consider both what would make each outcome happen and what would prevent it.
+4. Forecast EXACTLY the structured resolution criteria (subject, condition,
+   threshold, source of truth, resolution time), not a general impression of the
+   question. If the criteria are ambiguous, lower confidence and say so.
+5. Weight evidence by recency and source authority. If evidence is absent, stale,
+   or thin, stay near the base rate and lower confidence.
+6. Do NOT anchor on any market price. Form an independent estimate.
+
+Calibration rules:
+- Reserve probabilities near 0 or 1 for outcomes that are near-certain on strong
+  evidence. Otherwise stay away from the extremes.
+- confidence reflects how much reliable evidence supports the estimate, NOT how
+  likely the outcome is.
+- Never fabricate facts, sources, or figures. Unknown means low confidence.`;
+
+interface RawForecastResponse {
+  baseRate?: number;
+  outcomes?: Array<{ label?: string; probability?: number | null; confidence?: number }>;
+  reasoning?: string;
+  keyDrivers?: string[];
+  resolutionRisk?: string;
+  evidenceQuality?: string;
+}
+
+function buildUserPrompt(market: NormalizedMarket, structured: StructuredResolution, searchContext: string): string {
+  return `MARKET
+Question: ${market.question}
+Outcomes: ${JSON.stringify(market.outcomes)}
+Structured resolution:
+  subject: ${structured.subject}
+  condition: ${structured.condition}
+  threshold/comparator: ${structured.comparatorOrThreshold ?? "none stated"}
+  source of truth: ${structured.sourceOfTruth ?? "none stated"}
+  resolves at: ${structured.resolutionTime ?? "unknown"}
+Current time: ${new Date().toISOString()}
+
+EVIDENCE (retrieved; may be empty)
+${searchContext}
+
+TASK
+Estimate the probability of each listed outcome. Return ONLY this JSON, nothing
+else:
+{
+  "baseRate": <0-1, the reference-class rate you started from for the primary outcome>,
+  "outcomes": [
+    { "label": "<label>", "probability": <0-1 or null>, "confidence": <0-1> }
+  ],
+  "reasoning": "<2-4 sentences: reference class, main adjustment, why>",
+  "keyDrivers": ["<short factor>", "..."],
+  "resolutionRisk": "<ambiguity in how this resolves, or 'low'>",
+  "evidenceQuality": "strong | moderate | thin | none"
+}
+Rules: one entry per listed outcome in the given order. Mutually-exclusive,
+exhaustive outcomes should sum to ~1. If you can only estimate some outcomes, set
+the rest to null and lower confidence accordingly. No text outside the JSON.`;
+}
+
+const EVIDENCE_QUALITIES = new Set(["strong", "moderate", "thin", "none"]);
+
+function parseAndValidate(text: string, outcomeCount: number): ForecastResult | null {
+  const parsed = extractJson<RawForecastResponse>(text);
+  if (!parsed || !Array.isArray(parsed.outcomes)) return null;
+  if (parsed.outcomes.length !== outcomeCount) return null;
+
+  const outcomes: OutcomeEstimate[] = [];
+  for (const o of parsed.outcomes) {
+    if (o.probability !== null && o.probability !== undefined) {
+      if (typeof o.probability !== "number" || o.probability < 0 || o.probability > 1 || Number.isNaN(o.probability)) return null;
+    }
+    if (typeof o.confidence !== "number" || o.confidence < 0 || o.confidence > 1 || Number.isNaN(o.confidence)) return null;
+    outcomes.push({ probability: o.probability ?? null, confidence: o.confidence });
+  }
+
+  // Only enforce/renormalize sum-to-1 when every outcome was actually estimated —
+  // the prompt explicitly allows partial distributions (some outcomes null).
+  if (outcomes.every((o) => o.probability !== null)) {
+    const sum = outcomes.reduce((a, o) => a + o.probability!, 0);
+    if (Math.abs(sum - 1) > SUM_TOLERANCE) return null;
+    for (const o of outcomes) o.probability = o.probability! / sum;
+  }
+
+  if (typeof parsed.baseRate === "number" && (parsed.baseRate < 0 || parsed.baseRate > 1)) return null;
+  const evidenceQuality =
+    typeof parsed.evidenceQuality === "string" && EVIDENCE_QUALITIES.has(parsed.evidenceQuality)
+      ? (parsed.evidenceQuality as ForecastResult["evidenceQuality"])
+      : undefined;
+
+  return {
+    outcomes,
+    rationale: parsed.reasoning ?? "",
+    sourcesUsed: [],
+    baseRate: parsed.baseRate,
+    keyDrivers: Array.isArray(parsed.keyDrivers) ? parsed.keyDrivers.filter((k) => typeof k === "string") : undefined,
+    resolutionRisk: typeof parsed.resolutionRisk === "string" ? parsed.resolutionRisk : undefined,
+    evidenceQuality,
+  };
+}
 
 const cache = new Map<string, { inputHash: string; result: ForecastResult }>();
 
@@ -53,7 +158,7 @@ function hashInputs(market: NormalizedMarket, structured: StructuredResolution):
   });
 }
 
-/** Last forecastProbability() outcome, for reporting only (print-signals/paper-run) — mirrors llmClient's getLastLLMCallStatus but distinguishes "served from cache". */
+/** Last forecastProbability() outcome, for reporting only (print-signals/paper-run) — mirrors llmClient's getLastLLMCallStatus but distinguishes "served from cache" and "malformed JSON after retry". */
 export type ForecastOutcomeStatus = LLMCallStatus | "cached" | "parse_failed";
 let lastOutcomeStatus: ForecastOutcomeStatus | null = null;
 export function getLastForecastStatus(): ForecastOutcomeStatus | null {
@@ -76,68 +181,47 @@ export async function forecastProbability(
     return cached.result;
   }
 
+  let searchContext = "none available";
   let sourcesUsed: string[] = [];
-  let searchContext = "(no live search configured)";
   if (isSearchConfigured()) {
     const results = await search(market.question);
     if (results && results.length > 0) {
+      searchContext = results.map((r) => `- ${r.title} (${r.url}): ${r.snippet}`).join("\n");
       sourcesUsed = results.map((r) => r.url);
-      searchContext = results.map((r) => `- ${r.title}: ${r.snippet} (${r.url})`).join("\n");
     } else {
-      searchContext = "(search configured but returned no results)";
+      searchContext = "none available (search configured but returned no results)";
     }
   }
 
-  const userPrompt = [
-    `Question: ${market.question}`,
-    `Outcomes (in order): ${JSON.stringify(market.outcomes)}`,
-    `Subject: ${structured.subject}`,
-    `Condition: ${structured.condition}`,
-    structured.comparatorOrThreshold ? `Threshold: ${structured.comparatorOrThreshold}` : null,
-    `Resolves at: ${structured.resolutionTime ?? "unknown"}`,
-    `Search results:\n${searchContext}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const userPrompt = buildUserPrompt(market, structured, searchContext);
 
-  const text = await callLLM(SYSTEM_PROMPT, userPrompt);
+  let text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
   const callStatus = getLastLLMCallStatus();
   if (!text) {
-    // Rate-limited or errored — deliberately NOT cached, so the next pass retries with fresh inputs.
+    // Network/config/rate-limit failure — already retried at the network layer (backoff). Not the "malformed JSON" case.
     lastOutcomeStatus = callStatus ?? "error";
     return null;
   }
 
-  const parsed = extractJson<{ probabilities?: number[]; confidence?: number; rationale?: string }>(text);
-  if (!parsed || !Array.isArray(parsed.probabilities) || typeof parsed.confidence !== "number") {
-    lastOutcomeStatus = "parse_failed";
-    return null;
-  }
-  if (parsed.probabilities.length !== market.outcomeCount) {
-    lastOutcomeStatus = "parse_failed";
-    return null;
-  }
-  if (parsed.probabilities.some((p) => typeof p !== "number" || p < 0 || p > 1 || Number.isNaN(p))) {
-    lastOutcomeStatus = "parse_failed";
-    return null;
-  }
+  let result = parseAndValidate(text, market.outcomeCount);
 
-  const sum = parsed.probabilities.reduce((a, b) => a + b, 0);
-  if (Math.abs(sum - 1) > SUM_TOLERANCE) {
-    lastOutcomeStatus = "parse_failed";
-    return null;
+  if (!result) {
+    // Malformed JSON — retry once with a fresh call, per instruction. Never guess past this.
+    for (let attempt = 0; attempt < MALFORMED_JSON_RETRIES && !result; attempt++) {
+      text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
+      if (!text) {
+        lastOutcomeStatus = getLastLLMCallStatus() ?? "error";
+        return null;
+      }
+      result = parseAndValidate(text, market.outcomeCount);
+    }
+    if (!result) {
+      lastOutcomeStatus = "parse_failed";
+      return null;
+    }
   }
 
-  const confidence = Math.min(1, Math.max(0, parsed.confidence));
-  // Renormalize to exactly 1 (the LLM's raw output is "approximately 1" by prompt contract).
-  const outcomes: OutcomeEstimate[] = parsed.probabilities.map((p) => ({ probability: p / sum, confidence }));
-
-  const result: ForecastResult = {
-    outcomes,
-    rationale: parsed.rationale ?? "",
-    sourcesUsed,
-  };
-
+  result.sourcesUsed = sourcesUsed;
   cache.set(market.address, { inputHash, result });
   lastOutcomeStatus = "ok";
   return result;
