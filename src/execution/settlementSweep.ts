@@ -19,6 +19,7 @@ import { LIQUIDATABLE_MARKET_STATUSES, quoteRedeem, quoteLiquidate, redeemMarket
 import { isLive } from "../config/index.js";
 import type { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 import type { SettlementRecord } from "../portfolio/types.js";
+import { logSettlement } from "../logging/index.js";
 
 export interface MockOptions {
   mocked: true;
@@ -54,6 +55,7 @@ export async function sweepPosition(
     }
     const record: SettlementRecord = { timestamp: new Date().toISOString(), marketAddress, kind: "redeem", tokensOut, mocked };
     portfolio.recordSettlement(record, marketAddress, outcomeIdx);
+    await logSettlement(record).catch(() => {});
     return record;
   }
 
@@ -74,6 +76,7 @@ export async function sweepPosition(
     }
     const record: SettlementRecord = { timestamp: new Date().toISOString(), marketAddress, kind: "liquidate", tokensOut, mocked };
     portfolio.recordSettlement(record, marketAddress, outcomeIdx);
+    await logSettlement(record).catch(() => {});
     return record;
   }
 

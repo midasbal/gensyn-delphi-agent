@@ -5,9 +5,19 @@
  * quotes. See execution/ for the LIVE-mode equivalent (reads real balances).
  */
 import type { Position, TradeRecord, SettlementRecord } from "./types.js";
+import type { PositionValuation } from "./valuation.js";
 
 function positionKey(marketAddress: string, outcomeIdx: number): string {
   return `${marketAddress}-${outcomeIdx}`;
+}
+
+export interface PersistedPortfolio {
+  startingBankroll: number;
+  bankroll: number;
+  positions: Position[];
+  trades: TradeRecord[];
+  settlements: SettlementRecord[];
+  realizedPnl: number;
 }
 
 export class PaperPortfolio {
@@ -63,20 +73,53 @@ export class PaperPortfolio {
     return new Set(this.trades.map((t) => t.marketAddress)).size;
   }
 
-  /** Unrealized PnL: shares * livePrice - costBasis, summed over open positions whose price is known. */
-  unrealizedPnl(pricesByMarket: Map<string, number[]>): number {
+  /**
+   * Unrealized PnL: valuation.value - costBasis, summed over positions with
+   * a valuation. `valuations` MUST come from portfolio/valuation.ts's
+   * valuePositions() (status-aware: spot for open, deterministic 1/0 payout
+   * for settled, real quoteLiquidate for expired/failed) — this method no
+   * longer computes value itself, precisely because "shares * last price"
+   * is wrong once a market has closed (see valuation.ts's header for why
+   * this replaced that).
+   */
+  unrealizedPnl(valuations: Map<string, PositionValuation>): number {
     let total = 0;
-    for (const position of this.positions.values()) {
-      const prices = pricesByMarket.get(position.marketAddress);
-      const livePrice = prices?.[position.outcomeIdx];
-      if (livePrice === undefined) continue;
-      total += position.shares * livePrice - position.costBasis;
+    for (const [key, position] of this.positions) {
+      const valuation = valuations.get(key);
+      if (!valuation) continue;
+      total += valuation.value - position.costBasis;
     }
     return total;
   }
 
-  summary(pricesByMarket: Map<string, number[]>) {
-    const unrealized = this.unrealizedPnl(pricesByMarket);
+  /** For persistence/index.ts. */
+  exportState(): PersistedPortfolio {
+    return {
+      startingBankroll: this.startingBankroll,
+      bankroll: this.bankroll,
+      positions: [...this.positions.values()],
+      trades: [...this.trades],
+      settlements: [...this.settlements],
+      realizedPnl: this.realizedPnl,
+    };
+  }
+
+  /** For persistence/index.ts, on startup load — reconstructs a PaperPortfolio from a prior run's persisted state instead of starting fresh (startingBankroll is readonly, so this goes through the constructor rather than mutating an existing instance). */
+  static fromPersisted(data: PersistedPortfolio): PaperPortfolio {
+    const portfolio = new PaperPortfolio(data.startingBankroll);
+    portfolio.bankroll = data.bankroll;
+    for (const position of data.positions) {
+      portfolio.positions.set(positionKey(position.marketAddress, position.outcomeIdx), position);
+    }
+    portfolio.trades.push(...data.trades);
+    portfolio.settlements.push(...data.settlements);
+    portfolio.realizedPnl = data.realizedPnl;
+    return portfolio;
+  }
+
+  summary(valuations: Map<string, PositionValuation>) {
+    const unrealized = this.unrealizedPnl(valuations);
+    const provisionalCount = [...this.positions.keys()].filter((key) => valuations.get(key)?.provisional).length;
     return {
       startingBankroll: this.startingBankroll,
       bankroll: this.bankroll,
@@ -86,11 +129,15 @@ export class PaperPortfolio {
       realizedPnl: this.realizedPnl,
       unrealizedPnl: unrealized,
       totalPnl: this.realizedPnl + unrealized,
-      accountValue: this.bankroll + [...this.positions.values()].reduce((sum, p) => {
-        const prices = pricesByMarket.get(p.marketAddress);
-        const livePrice = prices?.[p.outcomeIdx];
-        return sum + (livePrice !== undefined ? p.shares * livePrice : p.costBasis);
-      }, 0),
+      /** True if ANY open position's value fell back to cost basis rather than a real quote/payout — see valuation.ts. Check before trusting accountValue precisely. */
+      hasProvisionalValuations: provisionalCount > 0,
+      provisionalPositionCount: provisionalCount,
+      accountValue:
+        this.bankroll +
+        [...this.positions.entries()].reduce((sum, [key, p]) => {
+          const valuation = valuations.get(key);
+          return sum + (valuation ? valuation.value : p.costBasis);
+        }, 0),
     };
   }
 }

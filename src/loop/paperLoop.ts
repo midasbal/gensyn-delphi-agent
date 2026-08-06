@@ -46,6 +46,7 @@ import { selectCandidate, runRiskGate } from "../risk/gates.js";
 import { executeTrade } from "../execution/paperTrade.js";
 import { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 import { activity, layers } from "../config/index.js";
+import { logDecision } from "../logging/index.js";
 import type { NormalizedMarket } from "../markets/types.js";
 import type { ConsensusMatch } from "../signals/consensus/types.js";
 import type { StructuredResolution } from "../signals/forecasting/types.js";
@@ -180,7 +181,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
         layers: {
           layerA: layers.aEnabled ? moveCheck : undefined,
           layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
-          layerC: withinMarket ? { withinMarketFlagged: withinMarket.flagged, drift: withinMarket.drift } : undefined,
+          layerC: withinMarket ? { withinMarketFlagged: withinMarket.flaggedForReview, drift: withinMarket.drift } : undefined,
         },
       });
       continue;
@@ -202,7 +203,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     const layerLog: LayerLog = {
       layerA: layers.aEnabled ? moveCheck : undefined,
       layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
-      layerC: withinMarket ? { withinMarketFlagged: withinMarket.flagged, drift: withinMarket.drift } : undefined,
+      layerC: withinMarket ? { withinMarketFlagged: withinMarket.flaggedForReview, drift: withinMarket.drift } : undefined,
       layerD: layers.dEnabled ? { herdingDetected, corroborated, confidenceBump } : undefined,
     };
 
@@ -293,6 +294,12 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
 
   const distinctMarketsTraded = portfolio.distinctMarketsTraded();
   const tradeCount = portfolio.trades.length;
+
+  // --- Structured logging (logging/): one line per decision. Trade fills log
+  // themselves from execution/paperTrade.ts's single choke point, not here —
+  // see that file's comment for why (so ad-hoc fills outside this loop, e.g.
+  // scripts/paper-run.ts's synthetic demo, are never silently unlogged). ---
+  await Promise.all(decisions.map((d) => logDecision(d).catch(() => {})));
 
   return {
     decisions,

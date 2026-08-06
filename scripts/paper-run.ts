@@ -15,6 +15,7 @@ import { runRiskGate } from "../src/risk/gates.js";
 import { executeTrade } from "../src/execution/paperTrade.js";
 import { fetchOpenMarkets } from "../src/markets/fetch.js";
 import type { TradeCandidate } from "../src/risk/types.js";
+import { valuePositions, buildValuationContexts, type MarketValuationContext } from "../src/portfolio/valuation.js";
 
 console.log(`=== PAPER run — AGENT_MODE=${AGENT_MODE} (isLive=${isLive()}) ===`);
 console.log(
@@ -73,12 +74,22 @@ if (portfolio.trades.length === 0) {
 }
 
 console.log("\n=== Synthetic demo: gates c-f + a real simulated fill ===\n");
-console.log(
-  "Every real candidate this pass was stopped at gate (b) oracle-ambiguity — expected, since ANTHROPIC_API_KEY is unconfigured so every resolution is the degraded (non-LLM-structured) fallback, which always scores maximum ambiguity. That's honest, but it means gates c-f (edge/extremes/sizing/slippage) and a real fill never fired on real data. This demo forces a candidate past gates a+b with a SYNTHETIC probability/structured-resolution (clearly not a real signal) on a REAL live market address, so the quote/slippage/sizing/fill path underneath is proven against the actual chain, not mocked.\n"
-);
 
-const demoMarkets = await fetchOpenMarkets({ limit: 1 });
-if (demoMarkets.length > 0) {
+// PAPER-ONLY FENCE (Phase 5 pre-live hardening): this block injects a FAKE
+// probability/structured-resolution to force a candidate through the gate
+// pipeline for demonstration purposes. If this script were ever run with
+// AGENT_MODE=live, executeTrade's isLive() branch would send a REAL
+// buyShares transaction sized off that fake data — an actual on-chain trade
+// based on nothing real. This check makes that structurally impossible: the
+// synthetic block simply does not execute outside PAPER, full stop, no
+// matter what else changes in this file.
+const demoMarkets = isLive() ? [] : await fetchOpenMarkets({ limit: 1 });
+if (isLive()) {
+  console.log("SKIPPED — synthetic-candidate injection is fenced to PAPER only and this process is running LIVE (AGENT_MODE=live). See the fence comment in scripts/paper-run.ts.");
+} else if (demoMarkets.length > 0) {
+  console.log(
+    "Every real candidate this pass was stopped at gate (b) oracle-ambiguity — expected, since ANTHROPIC_API_KEY is unconfigured so every resolution is the degraded (non-LLM-structured) fallback, which always scores maximum ambiguity. That's honest, but it means gates c-f (edge/extremes/sizing/slippage) and a real fill never fired on real data. This demo forces a candidate past gates a+b with a SYNTHETIC probability/structured-resolution (clearly not a real signal) on a REAL live market address, so the quote/slippage/sizing/fill path underneath is proven against the actual chain, not mocked.\n"
+  );
   const demoMarket = demoMarkets[0]!;
   const demoPrice = demoMarket.spotPrices?.[0] ?? 0.5;
   const syntheticCandidate: TradeCandidate = {
@@ -136,7 +147,15 @@ console.log("\nFreed capital is back in portfolio.bankroll immediately, redeploy
 
 console.log("=== Portfolio summary ===\n");
 console.log("(includes the synthetic demo trade and mocked settlements above — this is the portfolio's actual state, not a real-activity-only view)\n");
-const summary = portfolio.summary(result.pricesByMarket);
+console.log(
+  "Position valuation now uses portfolio/valuation.ts (Phase 5 pre-live hardening): open positions mark at spot (correct pre-close, per Phase 3), settled positions use the deterministic 1/0 LMSR payout (no call needed), and expired/failed positions use a real quoteLiquidate — never the old flat 'shares * last price' for a closed market. Any position that couldn't be valued this way falls back to cost basis and is flagged, not guessed — see hasProvisionalValuations below.\n"
+);
+const knownValuationContexts = new Map<string, MarketValuationContext>(
+  result.decisions.map((d) => [d.market.address, { status: d.market.status, winningOutcomeIdx: d.market.winningOutcomeIdx, spotPrices: d.market.spotPrices }])
+);
+const valuationContexts = await buildValuationContexts([...portfolio.positions.values()], knownValuationContexts);
+const valuations = await valuePositions([...portfolio.positions.values()], valuationContexts);
+const summary = portfolio.summary(valuations);
 console.log(JSON.stringify(summary, null, 2));
 
 console.log("\n=== Activity counters (toward competition minimums) ===\n");

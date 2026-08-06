@@ -12,6 +12,9 @@ dist/
 logs/
 *.log
 
+# ── Durable local state (persistence/) — machine-specific runtime data, not source ──
+state/
+
 # ── Installed skills (third-party — reinstallable via `npx skills add ...`,
 #    not our source). Also removes their bundled .md files (README.md,
 #    SKILL.md, reference/*.md, etc.) from consideration before the repo-root

@@ -36,6 +36,18 @@ Do not include any text outside the JSON object.`;
 
 const cache = new Map<string, StructuredResolution>();
 
+/** For persistence/index.ts — this cache is exactly what "never re-run" means: restoring it on startup avoids re-spending tokens on markets already structured in a prior run. */
+export function exportStructureCache(): Record<string, StructuredResolution> {
+  return Object.fromEntries(cache);
+}
+
+/** For persistence/index.ts, on startup load. Only imports entries that were actually LLM-structured — a persisted degraded fallback is never restored, for the same reason one is never cached in the first place (see file header). */
+export function importStructureCache(data: Record<string, StructuredResolution>): void {
+  for (const [address, resolution] of Object.entries(data)) {
+    if (resolution.structuredByLLM) cache.set(address, resolution);
+  }
+}
+
 function degradedFallback(market: NormalizedMarket): StructuredResolution {
   return {
     subject: market.resolution.criteria,

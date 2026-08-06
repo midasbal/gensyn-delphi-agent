@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { recordTokenUsage, tokensUsedInLast24h, remainingBudget, hasBudgetFor, resetTokenBudget } from "../src/signals/forecasting/tokenBudget.js";
+import { recordTokenUsage, tokensUsedInLast24h, tokensUsedInWindow, remainingBudget, hasBudgetFor, resetTokenBudget, throttleForRateLimit, exportUsageLog, importUsageLog } from "../src/signals/forecasting/tokenBudget.js";
 import { rankForecastCandidates, runForecastGovernor, ESTIMATED_TOKENS_PER_FORECAST, type ForecastCandidate } from "../src/signals/forecastGovernor.js";
 import { forecastBudget } from "../src/config/index.js";
 import type { NormalizedMarket } from "../src/markets/types.js";
@@ -150,4 +150,59 @@ test("runForecastGovernor — never calls the forecast function when there's no 
 
   assert.equal(called, false);
   assert.equal(outcomes[0]!.deferred, true);
+});
+
+// ---------- per-minute rate limiter (Phase 5 carry-forward correction) ----------
+
+test("throttleForRateLimit — does not sleep when well under the per-minute limit", async () => {
+  resetTokenBudget();
+  let sleepCalls = 0;
+  const fakeSleep = async () => {
+    sleepCalls++;
+  };
+  await throttleForRateLimit(900, () => 5_000_000_000, fakeSleep);
+  assert.equal(sleepCalls, 0);
+});
+
+test("throttleForRateLimit — sleeps (polls) while the trailing 1-minute window is over budget, then proceeds once it ages out", async () => {
+  resetTokenBudget();
+  let simulatedNow = 10_000_000_000;
+  const nowMs = () => simulatedNow;
+  recordTokenUsage(11_000, simulatedNow); // near the 12k/min real cap — with 80% margin (9600), this alone already exceeds it
+
+  let sleepCalls = 0;
+  const fakeSleep = async (ms: number) => {
+    sleepCalls++;
+    simulatedNow += ms;
+    if (sleepCalls > 5) simulatedNow += 61_000; // force the old usage to age out of the 1-minute window so the test terminates
+  };
+
+  await throttleForRateLimit(500, nowMs, fakeSleep);
+  assert.ok(sleepCalls > 0);
+  assert.ok(tokensUsedInWindow(60_000, simulatedNow) < 11_000); // the old entry aged out
+});
+
+test("tokensUsedInWindow — only counts entries inside the requested window", () => {
+  resetTokenBudget();
+  const now = 20_000_000_000;
+  recordTokenUsage(1000, now - 30_000); // inside 1min window
+  recordTokenUsage(2000, now - 90_000); // outside 1min window, inside 24h
+  assert.equal(tokensUsedInWindow(60_000, now), 1000);
+  assert.equal(tokensUsedInWindow(24 * 60 * 60 * 1000, now), 3000);
+});
+
+// ---------- persistence round-trip (export/import) ----------
+
+test("exportUsageLog/importUsageLog — round-trips usage so a restart doesn't lose the window", () => {
+  resetTokenBudget();
+  const now = 30_000_000_000;
+  recordTokenUsage(1234, now);
+  recordTokenUsage(5678, now + 1000);
+  const exported = exportUsageLog();
+
+  resetTokenBudget();
+  assert.equal(tokensUsedInLast24h(now + 2000), 0); // confirm reset actually cleared it
+
+  importUsageLog(exported, now + 2000);
+  assert.equal(tokensUsedInLast24h(now + 2000), 1234 + 5678);
 });

@@ -45,6 +45,18 @@ export function clearLastActed(): void {
   lastActed.clear();
 }
 
+/** For persistence/index.ts. */
+export function exportLastActed(): Record<string, LastActed> {
+  return Object.fromEntries(lastActed);
+}
+
+/** For persistence/index.ts, on startup load. Merges into (doesn't replace) the in-memory map. */
+export function importLastActed(data: Record<string, LastActed>): void {
+  for (const [address, baseline] of Object.entries(data)) {
+    lastActed.set(address, baseline);
+  }
+}
+
 export interface MoveCheck {
   moved: boolean;
   referenceDelta: number | null;

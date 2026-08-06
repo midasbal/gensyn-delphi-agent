@@ -106,17 +106,17 @@ test("Layer B decideLongTail — unknown trade count (query failed) is not assum
 
 // ---------- Layer C: coherence ----------
 
-test("Layer C withinMarket — flags drift beyond epsilon", () => {
+test("Layer C withinMarket — flags drift beyond epsilon (diagnostic only)", () => {
   const market = fakeMarket({ spotPrices: [0.5, 0.5001] });
   const result = checkWithinMarketCoherence(market);
-  assert.equal(result.flagged, true);
+  assert.equal(result.flaggedForReview, true);
   assert.ok(result.drift! > 0);
 });
 
 test("Layer C withinMarket — does not flag prices that sum to 1", () => {
   const market = fakeMarket({ spotPrices: [0.62, 0.38] });
   const result = checkWithinMarketCoherence(market);
-  assert.equal(result.flagged, false);
+  assert.equal(result.flaggedForReview, false);
 });
 
 test("Layer C findRelatedPairs — high overlap classified confident, low overlap logged-only, no overlap dropped", () => {
@@ -183,47 +183,57 @@ test("Layer C planArbitragePair — refuses a non-binary pair", async () => {
 
 // ---------- Layer D: opponents ----------
 
-function trade(outcomeIdx: number, side: "buy" | "sell", t: number): FeedTrade {
-  return { outcomeIdx, side, timestampSec: t };
+const MIN_TRADES = 5;
+const MIN_NOTIONAL = 5;
+
+function trade(outcomeIdx: number, side: "buy" | "sell", t: number, notionalTst: number = 2): FeedTrade {
+  return { outcomeIdx, side, timestampSec: t, notionalTst };
 }
 
-test("Layer D detectHerding — insufficient sample size is not detected", () => {
+test("Layer D detectHerding — insufficient trade count is not detected", () => {
   const trades = [trade(0, "buy", 100), trade(0, "buy", 99)];
-  const result = detectHerding(trades);
+  const result = detectHerding(trades, MIN_TRADES, MIN_NOTIONAL);
   assert.equal(result.detected, false);
-  assert.match(result.reason, /below the minimum burst size/);
+  assert.match(result.reason, /below the minimum trade count/);
+});
+
+test("Layer D detectHerding — enough trades but dust notional is not detected", () => {
+  const trades = [trade(1, "buy", 105, 0.01), trade(1, "buy", 104, 0.01), trade(1, "buy", 103, 0.01), trade(1, "buy", 102, 0.01), trade(1, "buy", 101, 0.01)];
+  const result = detectHerding(trades, MIN_TRADES, MIN_NOTIONAL);
+  assert.equal(result.detected, false);
+  assert.match(result.reason, /below the minimum.*TST/);
 });
 
 test("Layer D detectHerding — null trades (query failed) is not assumed quiet", () => {
-  const result = detectHerding(null);
+  const result = detectHerding(null, MIN_TRADES, MIN_NOTIONAL);
   assert.equal(result.detected, false);
   assert.match(result.reason, /query failed/);
 });
 
-test("Layer D detectHerding — concentrated burst is detected with correct direction", () => {
+test("Layer D detectHerding — concentrated burst with real notional is detected with correct direction", () => {
   const trades = [trade(1, "buy", 105), trade(1, "buy", 104), trade(1, "buy", 103), trade(1, "buy", 102), trade(1, "buy", 101), trade(0, "buy", 100)];
-  const result = detectHerding(trades);
+  const result = detectHerding(trades, MIN_TRADES, MIN_NOTIONAL);
   assert.equal(result.detected, true);
   assert.equal(result.direction, 1);
 });
 
 test("Layer D detectHerding — mixed-direction trades are not herding", () => {
   const trades = [trade(0, "buy", 105), trade(1, "buy", 104), trade(0, "buy", 103), trade(1, "buy", 102), trade(0, "buy", 101), trade(1, "buy", 100)];
-  const result = detectHerding(trades);
+  const result = detectHerding(trades, MIN_TRADES, MIN_NOTIONAL);
   assert.equal(result.detected, false);
 });
 
 test("Layer D corroboratesFade — only true when herding is on the OPPOSITE outcome from our candidate", () => {
-  const herdingOnOne: ReturnType<typeof detectHerding> = { detected: true, direction: 1, burstFraction: 1, sampleSize: 5, reason: "" };
+  const herdingOnOne: ReturnType<typeof detectHerding> = { detected: true, direction: 1, burstFraction: 1, sampleSize: 5, totalNotional: 10, reason: "" };
   assert.equal(corroboratesFade(herdingOnOne, 0), true); // our candidate buys outcome 0, herd buys 1 — corroborates
   assert.equal(corroboratesFade(herdingOnOne, 1), false); // herd buying the SAME outcome we'd buy — not a fade, not corroboration
 
-  const noHerding: ReturnType<typeof detectHerding> = { detected: false, direction: null, burstFraction: null, sampleSize: 0, reason: "" };
+  const noHerding: ReturnType<typeof detectHerding> = { detected: false, direction: null, burstFraction: null, sampleSize: 0, totalNotional: 0, reason: "" };
   assert.equal(corroboratesFade(noHerding, 0), false);
 });
 
 test("Layer D applyCorroborationBump — bumps confidence only when corroborating, capped at 1", () => {
-  const herding: ReturnType<typeof detectHerding> = { detected: true, direction: 1, burstFraction: 1, sampleSize: 5, reason: "" };
+  const herding: ReturnType<typeof detectHerding> = { detected: true, direction: 1, burstFraction: 1, sampleSize: 5, totalNotional: 10, reason: "" };
   assert.ok(applyCorroborationBump(0.5, herding, 0) > 0.5);
   assert.equal(applyCorroborationBump(0.5, herding, 1), 0.5); // not corroborating — unchanged
   assert.equal(applyCorroborationBump(0.95, herding, 0), 1); // capped

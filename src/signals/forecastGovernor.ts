@@ -14,15 +14,10 @@
 import type { NormalizedMarket } from "../markets/types.js";
 import type { StructuredResolution, ForecastResult } from "./forecasting/types.js";
 import { forecastProbability } from "./forecasting/forecast.js";
-import { hasBudgetFor } from "./forecasting/tokenBudget.js";
+import { hasBudgetFor, ESTIMATED_TOKENS_PER_FORECAST } from "./forecasting/tokenBudget.js";
 import { forecastBudget } from "../config/index.js";
 
-// Calibrated against a real live Groq forecast call this phase: measured
-// usage.total_tokens was 863 for one forecastProbability() call against a
-// live competition market (llama-3.3-70b-versatile, this project's actual
-// system+user prompt). Rounded up to 900 so the governor is conservative
-// about how many calls it thinks it can afford, not optimistic.
-export const ESTIMATED_TOKENS_PER_FORECAST = 900;
+export { ESTIMATED_TOKENS_PER_FORECAST };
 
 export interface ForecastCandidate {
   market: NormalizedMarket;

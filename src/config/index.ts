@@ -111,8 +111,13 @@ export const layers = {
   // Layer C — cross-market coherence.
   cEnabled: boolEnv("C_ENABLED", false),
 
-  // Layer D — opponent modeling (public subgraph data only).
+  // Layer D — opponent modeling (public subgraph data only). A herding call
+  // requires BOTH a minimum trade count AND a minimum total notional in the
+  // observed window — a handful of dust-sized trades shouldn't count as a
+  // crowd (Phase 5 carry-forward correction).
   dEnabled: boolEnv("D_ENABLED", false),
+  dMinTrades: Number(process.env.D_MIN_TRADES ?? 5),
+  dMinNotional: Number(process.env.D_MIN_NOTIONAL ?? 5), // TST
 };
 
 // --- F2: forecast token-budget governor (Phase 4). Protects the free Groq
@@ -122,6 +127,15 @@ export const forecastBudget = {
   dailyTokenBudget: Number(process.env.LLM_DAILY_TOKEN_BUDGET ?? 80_000),
   /** Re-forecast a market only after this many minutes, even if inputs are unchanged — not every loop pass. */
   forecastStalenessMinutes: Number(process.env.FORECAST_STALENESS_MINUTES ?? 30),
+};
+
+// --- Phase 5: the persistent loop's cadence + retry behavior. ---
+export const loop = {
+  /** Base interval between full decision passes. */
+  cadenceSeconds: Number(process.env.LOOP_CADENCE_SECONDS ?? 300),
+  /** Between cadence ticks, Layer A polls this often (reuses layers.aPollSeconds) and can trigger an early pass if a reference/price moves past threshold. */
+  maxRetries: Number(process.env.LOOP_MAX_RETRIES ?? 3),
+  retryBaseDelayMs: Number(process.env.LOOP_RETRY_BASE_DELAY_MS ?? 2000),
 };
 
 // --- Signal source config (Phase 2). Every key here is OPTIONAL — an

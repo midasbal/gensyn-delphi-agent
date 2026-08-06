@@ -13,6 +13,7 @@
     "print-signals": "tsx scripts/print-signals.ts",
     "demo-crypto-adapter": "tsx scripts/demo-crypto-adapter.ts",
     "paper-run": "tsx scripts/paper-run.ts",
+    "loop-demo": "tsx scripts/run-loop-demo.ts",
     "test": "tsx --test tests/**/*.test.ts"
   },
   "keywords": [],

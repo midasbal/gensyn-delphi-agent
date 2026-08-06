@@ -35,12 +35,18 @@ import type { StructuredResolution, ForecastResult } from "./types.js";
 import type { OutcomeEstimate } from "../types.js";
 import { isLLMConfigured, callLLM, extractJson, getLastLLMCallStatus, getLastTokensUsed, type LLMCallStatus } from "./llmClient.js";
 import { isSearchConfigured, search } from "./searchProvider.js";
-import { recordTokenUsage } from "./tokenBudget.js";
+import { recordTokenUsage, throttleForRateLimit, ESTIMATED_TOKENS_PER_FORECAST } from "./tokenBudget.js";
 import { forecastBudget } from "../../config/index.js";
 
 const TEMPERATURE = 0.2;
 const SUM_TOLERANCE = 0.05;
 const MALFORMED_JSON_RETRIES = 1;
+
+// Evidence trimming (Phase 5 carry-forward correction): cap how much search
+// context rides in each prompt, keeping calls lean and predictable for the
+// per-minute token-rate limiter below.
+const MAX_EVIDENCE_ITEMS = 3;
+const MAX_SNIPPET_CHARS = 300;
 
 const SYSTEM_PROMPT = `You are a calibrated forecasting engine for prediction markets. Your only job is
 to estimate the true probability of each outcome as accurately and honestly as
@@ -151,7 +157,7 @@ function parseAndValidate(text: string, outcomeCount: number): ForecastResult | 
   };
 }
 
-interface CacheEntry {
+export interface CacheEntry {
   inputHash: string;
   result: ForecastResult;
   cachedAtMs: number;
@@ -161,6 +167,18 @@ const cache = new Map<string, CacheEntry>();
 /** For F2's staleness ranking (forecastGovernor.ts) — null if never forecast. */
 export function getLastForecastTimeMs(marketAddress: string): number | null {
   return cache.get(marketAddress)?.cachedAtMs ?? null;
+}
+
+/** For persistence/index.ts. Persists cachedAtMs (per-market last-forecast timestamp, required durable) alongside the full result — restoring the result too avoids a wasted re-forecast immediately after restart when the cache is still fresh. */
+export function exportForecastCache(): Record<string, CacheEntry> {
+  return Object.fromEntries(cache);
+}
+
+/** For persistence/index.ts, on startup load. */
+export function importForecastCache(data: Record<string, CacheEntry>): void {
+  for (const [address, entry] of Object.entries(data)) {
+    cache.set(address, entry);
+  }
 }
 
 function hashInputs(market: NormalizedMarket, structured: StructuredResolution): string {
@@ -205,8 +223,10 @@ export async function forecastProbability(
   if (isSearchConfigured()) {
     const results = await search(market.question);
     if (results && results.length > 0) {
-      searchContext = results.map((r) => `- ${r.title} (${r.url}): ${r.snippet}`).join("\n");
-      sourcesUsed = results.map((r) => r.url);
+      // Evidence trimming (Phase 5 carry-forward correction): top-N only, each snippet capped — keeps every call lean and predictable for the per-minute rate limiter below.
+      const trimmed = results.slice(0, MAX_EVIDENCE_ITEMS);
+      searchContext = trimmed.map((r) => `- ${r.title} (${r.url}): ${r.snippet.slice(0, MAX_SNIPPET_CHARS)}`).join("\n");
+      sourcesUsed = trimmed.map((r) => r.url);
     } else {
       searchContext = "none available (search configured but returned no results)";
     }
@@ -214,6 +234,10 @@ export async function forecastProbability(
 
   const userPrompt = buildUserPrompt(market, structured, searchContext);
 
+  // Per-minute pacing (Phase 5 carry-forward correction): Groq's binding
+  // limit is 12k tokens/MIN, not the daily figure — this can genuinely
+  // sleep to stay under it with margin, before spending the call.
+  await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
   let text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
   const callStatus = getLastLLMCallStatus();
   const tokensUsed1 = getLastTokensUsed();
@@ -229,6 +253,7 @@ export async function forecastProbability(
   if (!result) {
     // Malformed JSON — retry once with a fresh call, per instruction. Never guess past this.
     for (let attempt = 0; attempt < MALFORMED_JSON_RETRIES && !result; attempt++) {
+      await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
       text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
       const tokensUsed2 = getLastTokensUsed();
       if (tokensUsed2 !== null) recordTokenUsage(tokensUsed2);

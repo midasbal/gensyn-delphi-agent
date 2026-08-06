@@ -41,9 +41,9 @@ export interface ResolutionLogEntry {
   oracleFailed: boolean;
 }
 
-// Process-lifetime only, same caveat as layers/latency's lastActed map —
-// Phase 5's persistent logging is what makes this durable across runs.
-const resolutionLog: ResolutionLogEntry[] = [];
+// Durable via persistence/index.ts (exportResolutionLog/importResolutionLog)
+// as of Phase 5 — a restart no longer loses this.
+let resolutionLog: ResolutionLogEntry[] = [];
 
 export function recordResolution(entry: ResolutionLogEntry): void {
   resolutionLog.push(entry);
@@ -51,4 +51,14 @@ export function recordResolution(entry: ResolutionLogEntry): void {
 
 export function getResolutionLog(): readonly ResolutionLogEntry[] {
   return resolutionLog;
+}
+
+/** For persistence/index.ts. */
+export function exportResolutionLog(): ResolutionLogEntry[] {
+  return [...resolutionLog];
+}
+
+/** For persistence/index.ts, on startup load. Replaces the in-memory log entirely. */
+export function importResolutionLog(entries: ResolutionLogEntry[]): void {
+  resolutionLog = [...entries];
 }

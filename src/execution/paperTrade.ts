@@ -13,6 +13,7 @@ import { buyShares, ensureTokenApproval } from "../sdk/client.js";
 import type { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 import type { TradeRecord } from "../portfolio/types.js";
 import type { ClippedTrade } from "../risk/types.js";
+import { logTrade } from "../logging/index.js";
 
 const sharesToBigint = (n: number): bigint => BigInt(Math.round(n * 1e18));
 const tokensToBigint = (n: number): bigint => BigInt(Math.round(n * 1e6));
@@ -41,8 +42,13 @@ export async function executeTrade(trade: ClippedTrade, portfolio: PaperPortfoli
     await buyShares(trade.market.address, trade.outcomeIdx, sharesToBigint(trade.finalShares), maxTokensIn);
   }
 
-  // Bookkeeping happens unconditionally so PAPER and LIVE produce the same
-  // shape of record/log; only the on-chain call above is mode-gated.
+  // Bookkeeping + structured logging happen unconditionally so PAPER and
+  // LIVE produce the same shape of record/log; only the on-chain call above
+  // is mode-gated. Logged HERE (the single choke point every fill passes
+  // through — real pipeline trades via loop/paperLoop.ts AND ad-hoc ones
+  // like scripts/paper-run.ts's synthetic gate demo) rather than at each
+  // call site, so no fill can accidentally skip the trade log.
   portfolio.recordBuy(record);
+  await logTrade(record).catch(() => {});
   return record;
 }
