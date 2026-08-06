@@ -1,55 +1,166 @@
 /**
- * Minimal Anthropic Messages API client, gated on ANTHROPIC_API_KEY.
+ * Provider-agnostic LLM client for structureResolution.ts / forecast.ts.
+ * Public interface is unchanged from the single-provider version:
+ * `isLLMConfigured()` / `callLLM(system, user) -> Promise<string | null>`.
+ * Callers never see which provider is active.
  *
- * NOT independently verified live this session — no ANTHROPIC_API_KEY is
- * provisioned in .env, so structureResolution.ts and forecast.ts have only
- * ever exercised their "unconfigured" degrade path. The request/response
- * handling follows the documented Messages API shape but should be treated
- * as unverified until it runs once with a real key.
+ * Default provider: Groq (free tier) — LLM_PROVIDER=groq (or unset).
+ *   - Groq exposes an OpenAI-compatible chat-completions API at
+ *     https://api.groq.com/openai/v1, key from GROQ_API_KEY.
+ *   - Default model: `llama-3.3-70b-versatile`. Confirmed LIVE against
+ *     console.groq.com/docs/models on 2026-08-06 (not assumed from training
+ *     data, per instruction) — listed there under "Production Models"
+ *     ("intended for use in your production environments"), 131,072-token
+ *     context, no deprecation warning. Note: a web search on the same day
+ *     surfaced third-party aggregator pages (not Groq's own docs) claiming
+ *     this model is deprecated in favor of `openai/gpt-oss-120b` — the
+ *     primary source (Groq's docs page, fetched twice) directly contradicts
+ *     that, so this uses the primary source. If Groq actually deprecates it
+ *     later, override with LLM_MODEL=openai/gpt-oss-120b in .env; no code
+ *     change needed.
+ *   - Free-tier rate limits confirmed from console.groq.com/docs/rate-limits
+ *     for this model: 30 requests/min, 1,000 requests/day, 12,000
+ *     tokens/min, 100,000 tokens/day. That's tight enough that backoff and
+ *     forecast caching (see forecast.ts) aren't optional — see below.
  *
- * No SDK dependency added for this — it's a single JSON POST, and pulling in
- * @anthropic-ai/sdk for one endpoint isn't worth the footprint.
+ * Alternate providers:
+ *   - LLM_PROVIDER=anthropic — Messages API, key from ANTHROPIC_API_KEY.
+ *   - LLM_PROVIDER=openai-compatible — any OpenAI-chat-completions-shaped
+ *     endpoint (local vLLM/Ollama, another hosted provider), base URL from
+ *     OPENAI_COMPATIBLE_BASE_URL, key from OPENAI_COMPATIBLE_API_KEY.
+ *
+ * Whichever provider is active, a missing key degrades to
+ * isLLMConfigured()===false and callLLM()===null — never a crash. A
+ * persistent 429 (rate-limited even after backoff) also returns null, which
+ * the caller (forecast.ts) treats as "defer this market to the next pass",
+ * not a hard failure — see getLastCallStatus() for observability without
+ * changing callLLM's return type.
  */
 import { signals } from "../../config/index.js";
 
-const API_URL = "https://api.anthropic.com/v1/messages";
-const API_VERSION = "2023-06-01";
 const FETCH_TIMEOUT_MS = 30_000;
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
 
-export function isLLMConfigured(): boolean {
-  return !!signals.llmApiKey;
+export type LLMCallStatus = "ok" | "unconfigured" | "rate_limited" | "error";
+let lastCallStatus: LLMCallStatus | null = null;
+
+/** For reporting/observability only — does not change callLLM's contract. */
+export function getLastLLMCallStatus(): LLMCallStatus | null {
+  return lastCallStatus;
 }
 
-/** Returns the raw text of the first text content block, or null on any failure — never throws. */
-export async function callLLM(system: string, user: string): Promise<string | null> {
-  if (!signals.llmApiKey) return null;
+export function isLLMConfigured(): boolean {
+  switch (signals.llmProvider) {
+    case "groq":
+      return !!signals.groqApiKey;
+    case "anthropic":
+      return !!signals.anthropicApiKey;
+    case "openai-compatible":
+      return !!signals.openaiCompatibleApiKey && !!signals.openaiCompatibleBaseUrl;
+  }
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": signals.llmApiKey,
-        "anthropic-version": API_VERSION,
-      },
-      body: JSON.stringify({
-        model: signals.llmModel,
-        max_tokens: 1024,
-        system,
-        messages: [{ role: "user", content: user }],
-      }),
-      signal: controller.signal,
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-    const textBlock = data.content?.find((b) => b.type === "text");
-    return textBlock?.text ?? null;
-  } catch {
-    return null;
-  } finally {
+async function fetchWithBackoff(url: string, init: RequestInit): Promise<Response | null> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(url, { ...init, signal: controller.signal });
+    } catch {
+      clearTimeout(timeout);
+      return null;
+    }
     clearTimeout(timeout);
+
+    if (res.status !== 429) return res;
+    if (attempt === MAX_RETRIES) return res; // give up — caller sees the 429 and treats it as deferred, not a crash
+
+    const retryAfterHeader = res.headers.get("retry-after");
+    const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+    const backoffMs = Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt);
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  }
+  return null;
+}
+
+async function callAnthropic(system: string, user: string): Promise<string | null> {
+  const res = await fetchWithBackoff("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": signals.anthropicApiKey!,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({ model: signals.llmModel, max_tokens: 1024, system, messages: [{ role: "user", content: user }] }),
+  });
+  if (!res) {
+    lastCallStatus = "error";
+    return null;
+  }
+  if (res.status === 429) {
+    lastCallStatus = "rate_limited";
+    return null;
+  }
+  if (!res.ok) {
+    lastCallStatus = "error";
+    return null;
+  }
+  const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+  const textBlock = data.content?.find((b) => b.type === "text");
+  lastCallStatus = "ok";
+  return textBlock?.text ?? null;
+}
+
+/** Shared by Groq and the generic openai-compatible provider — both speak the OpenAI chat-completions shape. */
+async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: string, user: string): Promise<string | null> {
+  const res = await fetchWithBackoff(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: signals.llmModel,
+      max_tokens: 1024,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+  if (!res) {
+    lastCallStatus = "error";
+    return null;
+  }
+  if (res.status === 429) {
+    lastCallStatus = "rate_limited";
+    return null;
+  }
+  if (!res.ok) {
+    lastCallStatus = "error";
+    return null;
+  }
+  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  lastCallStatus = "ok";
+  return data.choices?.[0]?.message?.content ?? null;
+}
+
+export async function callLLM(system: string, user: string): Promise<string | null> {
+  if (!isLLMConfigured()) {
+    lastCallStatus = "unconfigured";
+    return null;
+  }
+
+  switch (signals.llmProvider) {
+    case "groq":
+      return callOpenAiCompatible("https://api.groq.com/openai/v1", signals.groqApiKey!, system, user);
+    case "anthropic":
+      return callAnthropic(system, user);
+    case "openai-compatible":
+      return callOpenAiCompatible(signals.openaiCompatibleBaseUrl!, signals.openaiCompatibleApiKey!, system, user);
   }
 }
 

@@ -13,6 +13,7 @@
 import type { ConsensusMatch, MatchQuality } from "./consensus/types.js";
 import type { ForecastResult } from "./forecasting/types.js";
 import { estimatedCount, type OutcomeEstimate } from "./types.js";
+import { signals as signalsConfig } from "../config/index.js";
 
 export interface Contributor {
   source: string;
@@ -69,9 +70,16 @@ function combineOutcome(price: number, consensusEst: OutcomeEstimate | undefined
     probability = consensusEst!.probability!;
     confidence = consensusEst!.confidence;
   } else {
-    contributors.push({ source: "forecasting", probability: forecastEst!.probability!, confidence: forecastEst!.confidence, weight: 1 });
+    // Forecast-only (no consensus backing at all on this outcome): cap the
+    // confidence that flows into sizing at FORECAST_ONLY_MAX_WEIGHT,
+    // regardless of what the model self-reports. There's no live-resolution
+    // history yet to check this model's calibration against, so an
+    // overconfident/uncalibrated forecast can't dominate a trade on its own
+    // — see config/index.ts.
+    const cappedConfidence = Math.min(forecastEst!.confidence, signalsConfig.forecastOnlyMaxWeight);
+    contributors.push({ source: "forecasting", probability: forecastEst!.probability!, confidence: cappedConfidence, weight: 1 });
     probability = forecastEst!.probability!;
-    confidence = forecastEst!.confidence;
+    confidence = cappedConfidence;
   }
 
   return { probability, confidence, edge: probability - price, contributors };

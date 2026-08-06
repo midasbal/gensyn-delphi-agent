@@ -80,11 +80,38 @@ export const activity = {
 // --- Signal source config (Phase 2). Every key here is OPTIONAL — an
 // adapter/the LLM must report itself "unconfigured" and degrade to null
 // rather than throw when its key is absent. The user provisions these. ---
+export type LlmProvider = "groq" | "anthropic" | "openai-compatible";
+
+const rawLlmProvider = (process.env.LLM_PROVIDER ?? "groq").toLowerCase();
+if (rawLlmProvider !== "groq" && rawLlmProvider !== "anthropic" && rawLlmProvider !== "openai-compatible") {
+  throw new Error(`LLM_PROVIDER must be "groq", "anthropic", or "openai-compatible", got: ${JSON.stringify(process.env.LLM_PROVIDER)}`);
+}
+const llmProvider = rawLlmProvider as LlmProvider;
+
+// Per-provider default model — only used if LLM_MODEL is unset. Groq's
+// default was confirmed live against console.groq.com/docs/models (not
+// assumed from training data) — see llmClient.ts's header comment.
+const DEFAULT_LLM_MODEL: Record<LlmProvider, string> = {
+  groq: "llama-3.3-70b-versatile",
+  anthropic: "claude-sonnet-5",
+  "openai-compatible": "gpt-4o-mini",
+};
+
 export const signals = {
   oddsApiKey: process.env.ODDS_API_KEY || undefined,
-  llmApiKey: process.env.ANTHROPIC_API_KEY || undefined,
-  llmModel: process.env.LLM_MODEL ?? "claude-sonnet-5",
+  llmProvider,
+  groqApiKey: process.env.GROQ_API_KEY || undefined,
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || undefined,
+  openaiCompatibleApiKey: process.env.OPENAI_COMPATIBLE_API_KEY || undefined,
+  openaiCompatibleBaseUrl: process.env.OPENAI_COMPATIBLE_BASE_URL || undefined,
+  llmModel: process.env.LLM_MODEL || DEFAULT_LLM_MODEL[llmProvider],
   searchApiKey: process.env.SEARCH_API_KEY || undefined, // e.g. Tavily — for forecasting/ live news retrieval
+  /** Caps how much a forecast-ONLY signal (no consensus backing at all) can
+   *  influence sizing, regardless of the model's self-reported confidence —
+   *  see signals/combine.ts. Protects against an overconfident/uncalibrated
+   *  model dominating a trade before we have real resolution data to check
+   *  its calibration against (that's Phase 4 Layer F's job). */
+  forecastOnlyMaxWeight: Number(process.env.FORECAST_ONLY_MAX_WEIGHT ?? 0.5),
 };
 
 export { requireEnv };
