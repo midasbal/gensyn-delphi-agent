@@ -2,15 +2,148 @@
 
 An autonomous trading agent for the [Gensyn Delphi Agent Arena](https://delphi.gensyn.ai)
 competition (`competition-testnet`, LMSR prediction markets, TST collateral).
-Consensus-first, forecast-as-fallback strategy; six opt-in signal/risk layers
-on top of a conservative Kelly-sized risk gate. See
-[STRATEGY.md](STRATEGY.md) for the reasoning and
-[ARCHITECTURE.md](ARCHITECTURE.md) for the module map — both are local-only
-(gitignored), generated for the operator's own reference.
 
 **Runs in PAPER mode by default.** No on-chain transaction is ever sent
 unless `AGENT_MODE=live` is explicitly set — see
 ["Switching to LIVE"](#switching-to-live) below before you do that.
+
+## What this is
+
+This is an autonomous agent built to compete in the Gensyn Delphi Agent
+Arena — a competition where agents trade on-chain prediction markets and are
+ranked purely on profit and loss over a two-week window. Nothing about
+appearance, code style, or cleverness is judged directly; the only thing
+that matters is whether the agent's trades made money. This repo is that
+agent: its market-reading pipeline, its risk controls, and the
+infrastructure to run it unattended.
+
+## The problem, and the reasoning behind the approach
+
+Strip away the blockchain mechanics and the competition is a forecasting
+problem. Delphi's markets use LMSR (a logarithmic market scoring rule):
+each outcome has a price between 0 and 1, prices across a market's outcomes
+sum to 1, and a winning outcome's share pays exactly 1 TST at settlement.
+That price *is* the market's current implied probability. So the expected
+profit from buying a share is simply (your estimate of the true probability
+− the current price) — what this codebase calls "edge." Get the estimate
+right more often than the market does, size positions sensibly, and the
+expected value compounds. Get it wrong, systematically, and it doesn't
+matter how well-engineered the rest of the system is.
+
+That framing shaped the central design decision. The obvious, easy build is
+an "LLM oracle": point a language model at every market's question and
+trade whatever probability it returns. That's also the build most other
+entrants are likely to reach for — it's the path of least resistance. Two
+problems follow from that. First, an LLM's raw guess is an unreliable
+foundation to bet real capital on: it isn't grounded in any live reference
+market, it can't distinguish genuine insight from confident-sounding
+pattern completion, and there's no obvious way to know when to trust it.
+Second, if most competitors are running some version of the same "ask the
+model" strategy, that alone isn't a source of edge — everyone doing the
+same thing pushes prices toward whatever the models collectively agree on,
+which then stops being mispriced.
+
+The approach this agent takes instead: wherever a sharper, more liquid
+external reference for the same real-world event already exists — a
+Polymarket market, a sportsbook's odds, a live asset price — treat that
+market's own price discovery as the better estimate, and let this agent be
+a **consensus arbitrageur**, checking whether Delphi's price has caught up
+to what's already known elsewhere. Only when no such reference exists does
+the agent fall back to being a **disciplined forecaster**, spending an LLM
+call and treating the result with appropriate skepticism rather than
+uncritical trust. Consensus-following is lower-variance and easier to
+defend than independent forecasting; forecasting is the tool for the markets
+nothing else prices, not the primary edge source.
+
+## What the bot actually does
+
+At a high level, each pass through the pipeline:
+
+1. **Pulls open markets** from the Delphi API for the current competition.
+2. **Parses each market's resolution criteria** — what specifically has to
+   happen for an outcome to be declared the winner, and by when.
+3. **Estimates a probability** for each outcome — checking first for a
+   confident external consensus reference, and only spending an LLM
+   forecast on markets where no such reference exists.
+4. **Passes every candidate through a risk gate**, in order: is the signal
+   confident enough to act on at all; is the resolution criteria itself too
+   ambiguous to trust; is the edge large enough to be worth acting on; is
+   the price near an extreme (0 or 1) where caution should tighten; how
+   large a position does conservative, fractional-Kelly sizing justify; and
+   does the market have enough depth to fill that size without excessive
+   slippage. Any step can skip or shrink a trade — never expand or force one
+   through.
+5. **Only then trades** — booked as a simulated fill in PAPER mode, or a
+   real on-chain transaction in LIVE mode, depending on `AGENT_MODE`.
+
+On top of that core pipeline sit six additional, individually toggleable
+signal/risk layers. Each is described here at the level of *what it's for*
+— the specific thresholds and tuning live in a private strategy document,
+deliberately kept out of this public README while the competition is live:
+
+- **Latency** — notices when an external reference has moved since this
+  agent last acted on a market, so it can prioritize re-checking markets
+  most likely to have gone stale, rather than working through all of them
+  in a fixed order.
+- **Long-tail routing** — recognizes markets that are both un-referenced
+  and largely untraded, and prioritizes them for deeper research, on the
+  theory that the least-priced-in markets are where the most edge remains.
+- **Cross-market coherence** — checks whether two different markets that
+  describe the same real-world event are pricing it consistently, and can
+  act when a genuine, real disagreement between them appears.
+- **Opponent modeling** — reads public on-chain trade activity for
+  corroborating signal, never as a signal on its own and never from
+  anything other than public data.
+- **Oracle calibration** — assesses how cleanly a market's resolution
+  criteria will actually settle, so ambiguous markets get treated with
+  appropriately less confidence.
+- **Live calibration and endgame sizing** — intended, once real resolutions
+  and a real leaderboard position exist, to check whether the agent's
+  stated confidence has actually been trustworthy and to adjust risk
+  appetite as the competition window closes.
+
+## Design principles
+
+A few values are visible throughout the codebase, independent of any
+specific tactic:
+
+- **PAPER-first, with a hard gate to LIVE.** The agent defaults to
+  simulated trading and stays there until an operator explicitly and
+  deliberately flips one switch — see ["Switching to LIVE"](#switching-to-live).
+- **Rules-compliance enforced in code, not just policy.** Constraints like
+  trading from a single wallet, using only public data for opponent
+  modeling, and never trading purely to move price are structural
+  properties of how the code is written, not conventions an operator has to
+  remember to follow.
+- **Honest degradation over fabrication.** A missing API key, an
+  unconfigured signal source, or no confident match returns `null` and is
+  treated as "no information here" — never a guessed or fabricated number
+  standing in for a real one.
+- **Persistence, so a restart isn't a reset.** State survives a process
+  restart — a deployment doesn't lose track of what it already knows.
+- **Self-healing, so it doesn't need a human on call.** A watchdog process
+  detects a stuck (not just crashed) agent and restarts it automatically.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the module map and data flow,
+and [RULES.md](RULES.md) for the complete list of hard constraints and
+exactly how each is enforced (both gitignored, local reference — see
+["Local docs"](#local-docs-gitignored--not-tracked-for-your-own-reference)
+below).
+
+## Retrospective (to be completed after the competition)
+
+*This section is intentionally blank until the competition concludes — it
+will be filled in honestly, whatever the outcome.*
+
+### What we set out to achieve
+
+### What actually happened
+
+### What went to plan
+
+### What didn't, and why
+
+### What we'd do differently
 
 ## Setup
 
@@ -35,7 +168,7 @@ Fill in `.env`:
 
 ```bash
 npx tsc --noEmit     # typecheck
-npm test              # 106 tests, should all pass
+npm test              # 116 tests, should all pass
 ```
 
 ## Running in PAPER
@@ -218,5 +351,7 @@ tests/          node:test suite (npx tsx --test)
   gotchas discovered along the way.
 - [RULES.md](RULES.md) — every hard constraint and exactly how the code
   enforces it.
-- [STRATEGY.md](STRATEGY.md) — the thesis and reasoning, written for a human
-  evaluator.
+- [STRATEGY.md](STRATEGY.md) — the full thesis and tuned tactics, written
+  for a human evaluator. Kept private during the competition; this README's
+  ["What the bot actually does"](#what-the-bot-actually-does) section is the
+  public-safe summary of the same ideas.
