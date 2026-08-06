@@ -31,6 +31,7 @@ import type { ConsensusAdapter, ConsensusMatch } from "./types.js";
 import { distributionFromSingleOutcome } from "../types.js";
 import { signals } from "../../config/index.js";
 import { wordOverlapScore, dateProximityScore } from "./textMatch.js";
+import { fetchJsonWithTimeout } from "../../util/fetchJson.js";
 
 const BASE_URL = "https://api.the-odds-api.com/v4/sports";
 const FETCH_TIMEOUT_MS = 8000;
@@ -59,20 +60,6 @@ interface OddsEvent {
   home_team: string;
   away_team: string;
   bookmakers: Bookmaker[];
-}
-
-async function fetchJson<T>(url: string): Promise<T | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 /** No-vig implied probability for the named side, averaged across bookmakers. */
@@ -106,7 +93,7 @@ export const sportsOddsAdapter: ConsensusAdapter = {
 
     for (const sportKey of SPORT_KEYS) {
       const url = `${BASE_URL}/${sportKey}/odds?apiKey=${signals.oddsApiKey}&regions=us&markets=h2h`;
-      const events = await fetchJson<OddsEvent[]>(url);
+      const events = await fetchJsonWithTimeout<OddsEvent[]>(url, FETCH_TIMEOUT_MS);
       if (!events?.length) continue;
 
       for (const event of events) {

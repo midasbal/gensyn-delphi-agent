@@ -6,6 +6,7 @@
  * forecast on stale training knowledge as if it had checked the news.
  */
 import { signals } from "../../config/index.js";
+import { fetchJsonWithTimeout } from "../../util/fetchJson.js";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -22,30 +23,20 @@ export function isSearchConfigured(): boolean {
 export async function search(query: string): Promise<SearchResult[] | null> {
   if (!signals.searchApiKey) return null;
 
-  // Same hard-timeout backstop as llmClient.ts's fetchWithBackoff (Phase 5
-  // checkpoint finding): AbortController.abort() has been observed to not
-  // reliably unblock either the initial fetch() or a stalled res.json()
-  // body read, so both are raced against an independent timer.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  const timeoutRejection = () => new Promise<never>((_, reject) => setTimeout(() => reject(new Error("fetch-hard-timeout")), FETCH_TIMEOUT_MS));
-  try {
-    const res = await Promise.race([
-      fetch("https://api.tavily.com/search", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ api_key: signals.searchApiKey, query, max_results: 5 }),
-        signal: controller.signal,
-      }),
-      timeoutRejection(),
-    ]);
-    if (!res.ok) return null;
-    const data = (await Promise.race([res.json(), timeoutRejection()])) as { results?: Array<{ title: string; url: string; content: string }> };
-    if (!data.results) return null;
-    return data.results.map((r) => ({ title: r.title, url: r.url, snippet: r.content }));
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  // Cleanup pass: was a one-off inline hard-timeout backstop (Phase 5
+  // checkpoint finding — AbortController.abort() observed to not reliably
+  // unblock either the initial fetch() or a stalled res.json() body read);
+  // now shares the same implementation as the consensus adapters via
+  // util/fetchJson.ts, one fix instead of four near-identical ones.
+  const data = await fetchJsonWithTimeout<{ results?: Array<{ title: string; url: string; content: string }> }>(
+    "https://api.tavily.com/search",
+    FETCH_TIMEOUT_MS,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ api_key: signals.searchApiKey, query, max_results: 5 }),
+    }
+  );
+  if (!data?.results) return null;
+  return data.results.map((r) => ({ title: r.title, url: r.url, snippet: r.content }));
 }

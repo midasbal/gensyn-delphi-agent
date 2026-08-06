@@ -30,6 +30,7 @@ import type { NormalizedMarket } from "../../markets/types.js";
 import type { ConsensusAdapter, ConsensusMatch } from "./types.js";
 import { distributionFromSingleOutcome } from "../types.js";
 import { extractNumericCondition } from "./textMatch.js";
+import { fetchJsonWithTimeout } from "../../util/fetchJson.js";
 
 const FETCH_TIMEOUT_MS = 8000;
 const VOL_WINDOW_DAYS = 30;
@@ -45,20 +46,6 @@ const ASSET_ALIASES: Record<string, string> = {
   doge: "DOGEUSDT",
   dogecoin: "DOGEUSDT",
 };
-
-async function fetchJson<T>(url: string): Promise<T | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 function findAssetSymbol(text: string): string | null {
   const words = text.toLowerCase().match(/[a-z]+/g) ?? [];
@@ -83,8 +70,9 @@ function standardNormalCdf(x: number): number {
 }
 
 async function realizedDailyVolatility(symbol: string): Promise<number | null> {
-  const klines = await fetchJson<unknown[][]>(
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&limit=${VOL_WINDOW_DAYS + 1}`
+  const klines = await fetchJsonWithTimeout<unknown[][]>(
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&limit=${VOL_WINDOW_DAYS + 1}`,
+    FETCH_TIMEOUT_MS
   );
   if (!klines || klines.length < 3) return null;
 
@@ -119,7 +107,7 @@ export const cryptoAdapter: ConsensusAdapter = {
     if (horizonDays < 0) return null;
 
     const [ticker, dailyVol] = await Promise.all([
-      fetchJson<{ price: string }>(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`),
+      fetchJsonWithTimeout<{ price: string }>(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, FETCH_TIMEOUT_MS),
       realizedDailyVolatility(symbol),
     ]);
     if (!ticker || dailyVol === null) return null;

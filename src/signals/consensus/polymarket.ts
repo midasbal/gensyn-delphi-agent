@@ -45,6 +45,7 @@ import type { NormalizedMarket } from "../../markets/types.js";
 import type { ConsensusAdapter, ConsensusMatch } from "./types.js";
 import { distributionFromSingleOutcome } from "../types.js";
 import { wordOverlapScore, dateProximityScore, extractNumericCondition, numericConditionsAgree, buildSearchQuery } from "./textMatch.js";
+import { fetchJsonWithTimeout } from "../../util/fetchJson.js";
 
 const SEARCH_URL = "https://gamma-api.polymarket.com/public-search";
 const FETCH_TIMEOUT_MS = 8000;
@@ -70,20 +71,6 @@ interface PmEvent {
 
 interface PmSearchResponse {
   events?: PmEvent[];
-}
-
-async function fetchJson<T>(url: string): Promise<T | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 function parseJsonArray(raw: string | undefined): string[] {
@@ -134,7 +121,7 @@ export const polymarketAdapter: ConsensusAdapter = {
 
   async match(market: NormalizedMarket): Promise<ConsensusMatch | null> {
     const query = encodeURIComponent(buildSearchQuery(market.question));
-    const data = await fetchJson<PmSearchResponse>(`${SEARCH_URL}?q=${query}&limit_per_type=8`);
+    const data = await fetchJsonWithTimeout<PmSearchResponse>(`${SEARCH_URL}?q=${query}&limit_per_type=8`, FETCH_TIMEOUT_MS);
     if (!data?.events?.length) return null;
 
     let best: Candidate | null = null;

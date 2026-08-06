@@ -26,7 +26,6 @@
  * deferred to wave 2, since there's nothing to record yet: none of the 10
  * live competition markets have resolved as of this phase.
  */
-import type { NormalizedMarket } from "../../markets/types.js";
 import type { StructuredResolution } from "../../signals/forecasting/types.js";
 
 export interface ResolutionLogEntry {

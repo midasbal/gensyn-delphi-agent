@@ -13,14 +13,6 @@ import "dotenv/config";
 
 export type AgentMode = "paper" | "live";
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
-
 /** All *_ENABLED flags default to false — every Phase 4 layer is opt-in, nothing changes behavior until explicitly turned on. */
 function boolEnv(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
@@ -174,5 +166,3 @@ export const signals = {
    *  its calibration against (that's Phase 4 Layer F's job). */
   forecastOnlyMaxWeight: Number(process.env.FORECAST_ONLY_MAX_WEIGHT ?? 0.5),
 };
-
-export { requireEnv };

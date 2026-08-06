@@ -9,8 +9,7 @@
  * call/parse fails twice in a row, or the provider is rate-limited even
  * after backoff (llmClient.ts retries 429s internally; a persistent 429
  * here means "defer this market to the next pass" — returning null and
- * letting the loop move on already does that, no special-casing needed, but
- * see getLastForecastStatus() for reporting which case happened).
+ * letting the loop move on already does that, no special-casing needed).
  *
  * Malformed JSON gets exactly ONE retry (a fresh LLM call, not a re-parse of
  * the same text) before giving up — never a guess past that.
@@ -193,12 +192,20 @@ function hashInputs(market: NormalizedMarket, structured: StructuredResolution):
   });
 }
 
-/** Last forecastProbability() outcome, for reporting only (print-signals/paper-run) — mirrors llmClient's getLastLLMCallStatus but distinguishes "served from cache" and "malformed JSON after retry". */
-export type ForecastOutcomeStatus = LLMCallStatus | "cached" | "parse_failed";
+/**
+ * Tracks the outcome of the most recent forecastProbability() call — mirrors
+ * llmClient's LLMCallStatus but distinguishes "served from cache" and
+ * "malformed JSON after retry". Cleanup pass: the accessor that used to
+ * expose this (getLastForecastStatus) had zero callers (its own doc comment
+ * said "for reporting only (print-signals/paper-run)", but neither script
+ * ever actually read it) and was removed. `lastOutcomeStatus` itself is left
+ * as-is — every assignment below is load-bearing documentation of which
+ * branch a given call took, even though nothing currently reads the final
+ * value, and removing them would mean touching this function's actual
+ * control flow for zero behavioral gain.
+ */
+type ForecastOutcomeStatus = LLMCallStatus | "cached" | "parse_failed";
 let lastOutcomeStatus: ForecastOutcomeStatus | null = null;
-export function getLastForecastStatus(): ForecastOutcomeStatus | null {
-  return lastOutcomeStatus;
-}
 
 export async function forecastProbability(
   market: NormalizedMarket,

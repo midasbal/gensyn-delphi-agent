@@ -12,6 +12,7 @@
     "print-markets": "tsx scripts/print-markets.ts",
     "print-signals": "tsx scripts/print-signals.ts",
     "demo-crypto-adapter": "tsx scripts/demo-crypto-adapter.ts",
+    "demo-persistence-restart": "tsx scripts/demo-persistence-restart.ts",
     "paper-run": "tsx scripts/paper-run.ts",
     "loop-demo": "tsx scripts/run-loop-demo.ts",
     "agent": "tsx scripts/run-agent.ts",

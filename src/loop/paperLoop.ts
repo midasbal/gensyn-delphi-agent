@@ -52,7 +52,7 @@ import type { NormalizedMarket } from "../markets/types.js";
 import type { ConsensusMatch } from "../signals/consensus/types.js";
 import type { StructuredResolution } from "../signals/forecasting/types.js";
 
-import { checkMove, recordActedReference, prioritizeQueue } from "../layers/latency/index.js";
+import { checkMove, recordActedReference, prioritizeQueue, type MoveCheck } from "../layers/latency/index.js";
 import { classifyLongTail } from "../layers/longtail/index.js";
 import { checkWithinMarketCoherence } from "../layers/coherence/withinMarket.js";
 import { findRelatedPairs, detectJointIncoherence, toSubjectCandidate } from "../layers/coherence/acrossMarket.js";
@@ -85,6 +85,22 @@ export interface CoherencePairLog {
   reason: string;
   arbitrageExecuted: boolean;
   arbitrageProfit: number | null;
+}
+
+/**
+ * Cleanup pass: replaces the O(n^2) `moveChecks.find(m => m.market.address
+ * === market.address)` (a linear scan repeated once per market in the main
+ * decision loop) with a single O(n) map build + O(1) lookups — see
+ * tests/paperLoop.test.ts for a test pinning this against the original
+ * `.find()` semantics (first-match-wins on a duplicate address, though
+ * market addresses are unique in practice).
+ */
+export function buildMoveByAddress(moveChecks: Array<{ market: { address: string }; move: MoveCheck }>): Map<string, MoveCheck> {
+  const byAddress = new Map<string, MoveCheck>();
+  for (const m of moveChecks) {
+    if (!byAddress.has(m.market.address)) byAddress.set(m.market.address, m.move);
+  }
+  return byAddress;
 }
 
 export interface PaperPassResult {
@@ -127,6 +143,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     return { market, referenceProb, price, move };
   });
   const markets = layers.aEnabled ? prioritizeQueue(moveChecks) : fetchedMarkets;
+  const moveByAddress = buildMoveByAddress(moveChecks);
 
   // --- Structuring (cached forever per market) for every market ---
   const structuredByAddress = new Map<string, StructuredResolution>();
@@ -176,7 +193,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     const combined = combineSignals(market.spotPrices ?? market.outcomes.map(() => NaN), consensus, forecast);
 
     const withinMarket = withinMarketByAddress.get(market.address);
-    const moveCheck = moveChecks.find((m) => m.market.address === market.address)?.move;
+    const moveCheck = moveByAddress.get(market.address);
 
     const candidate = selectCandidate(market, combined);
     if (!candidate) {
