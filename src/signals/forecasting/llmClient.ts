@@ -82,13 +82,36 @@ export function isLLMConfigured(): boolean {
   }
 }
 
+/**
+ * Observed live (Phase 5 checkpoint): AbortController.abort() does not
+ * reliably unblock an in-flight fetch() in this environment — a stuck
+ * request can hang well past FETCH_TIMEOUT_MS with the abort signal fired
+ * and ignored. Racing fetch() against an independent timer is the backstop:
+ * it can't cancel the underlying request (that's still AbortController's
+ * job, kept below as a best-effort), but it guarantees this function itself
+ * never blocks the caller past FETCH_TIMEOUT_MS regardless of what the
+ * fetch promise does.
+ */
+function timeoutRejection(ms: number): Promise<never> {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error("fetch-hard-timeout")), ms));
+}
+
+/**
+ * Same backstop as fetchWithBackoff, but for reading the response body:
+ * headers can arrive while the body stream stalls, and that's a separate
+ * hang from the one AbortController is (unreliably) wired to above.
+ */
+function withHardTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([promise, timeoutRejection(ms)]);
+}
+
 async function fetchWithBackoff(url: string, init: RequestInit): Promise<Response | null> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     let res: Response;
     try {
-      res = await fetch(url, { ...init, signal: controller.signal });
+      res = await Promise.race([fetch(url, { ...init, signal: controller.signal }), timeoutRejection(FETCH_TIMEOUT_MS)]);
     } catch {
       clearTimeout(timeout);
       return null;
@@ -98,9 +121,16 @@ async function fetchWithBackoff(url: string, init: RequestInit): Promise<Respons
     if (res.status !== 429) return res;
     if (attempt === MAX_RETRIES) return res; // give up — caller sees the 429 and treats it as deferred, not a crash
 
+    // Phase 5 checkpoint finding: Groq's retry-after header can be huge
+    // (observed 200-1400+ seconds under real rate-limit pressure) — using it
+    // uncapped stalled the whole pipeline for minutes. Always cap at
+    // MAX_BACKOFF_MS: giving up sooner and deferring this market to the next
+    // pass is strictly better than blocking the loop on one server-suggested
+    // wait, especially since a persistent 429 is already treated as
+    // "deferred, not a crash" once retries are exhausted.
     const retryAfterHeader = res.headers.get("retry-after");
     const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : NaN;
-    const backoffMs = Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt);
+    const backoffMs = Number.isFinite(retryAfterSec) ? Math.min(MAX_BACKOFF_MS, retryAfterSec * 1000) : Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt);
     await new Promise((resolve) => setTimeout(resolve, backoffMs));
   }
   return null;
@@ -135,10 +165,13 @@ async function callAnthropic(system: string, user: string, temperature?: number)
     lastCallStatus = "error";
     return null;
   }
-  const data = (await res.json()) as {
-    content?: Array<{ type: string; text?: string }>;
-    usage?: { input_tokens?: number; output_tokens?: number };
-  };
+  let data: { content?: Array<{ type: string; text?: string }>; usage?: { input_tokens?: number; output_tokens?: number } };
+  try {
+    data = await withHardTimeout(res.json(), FETCH_TIMEOUT_MS);
+  } catch {
+    lastCallStatus = "error";
+    return null;
+  }
   const textBlock = data.content?.find((b) => b.type === "text");
   lastTokensUsed = data.usage ? (data.usage.input_tokens ?? 0) + (data.usage.output_tokens ?? 0) : null;
   lastCallStatus = "ok";
@@ -176,10 +209,13 @@ async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: str
     lastCallStatus = "error";
     return null;
   }
-  const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-    usage?: { total_tokens?: number };
-  };
+  let data: { choices?: Array<{ message?: { content?: string } }>; usage?: { total_tokens?: number } };
+  try {
+    data = await withHardTimeout(res.json(), FETCH_TIMEOUT_MS);
+  } catch {
+    lastCallStatus = "error";
+    return null;
+  }
   lastTokensUsed = data.usage?.total_tokens ?? null;
   lastCallStatus = "ok";
   return data.choices?.[0]?.message?.content ?? null;
