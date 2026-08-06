@@ -82,7 +82,9 @@ export interface GovernedForecastOutcome {
  */
 export async function runForecastGovernor(
   candidates: ForecastCandidate[],
-  forecastFn: (market: NormalizedMarket, structured: StructuredResolution) => Promise<ForecastResult | null> = forecastProbability
+  forecastFn: (market: NormalizedMarket, structured: StructuredResolution) => Promise<ForecastResult | null> = forecastProbability,
+  /** Phase 5B: called after each candidate (forecasted or deferred) — paperLoop.ts wires this to writeHeartbeat so a watchdog sees progress inside this sequential, LLM-call-heavy loop, not just once per whole pass. No-op by default so existing callers/tests are unaffected. */
+  onProgress: (marketAddress: string) => void = () => {}
 ): Promise<GovernedForecastOutcome[]> {
   const ranked = rankForecastCandidates(candidates);
   const outcomes: GovernedForecastOutcome[] = [];
@@ -90,10 +92,12 @@ export async function runForecastGovernor(
   for (const candidate of ranked) {
     if (!hasBudgetFor(ESTIMATED_TOKENS_PER_FORECAST)) {
       outcomes.push({ market: candidate.market, result: null, deferred: true });
+      onProgress(candidate.market.address);
       continue;
     }
     const result = await forecastFn(candidate.market, candidate.structured);
     outcomes.push({ market: candidate.market, result, deferred: false });
+    onProgress(candidate.market.address);
   }
 
   return outcomes;

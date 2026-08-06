@@ -14,6 +14,7 @@
     "demo-crypto-adapter": "tsx scripts/demo-crypto-adapter.ts",
     "paper-run": "tsx scripts/paper-run.ts",
     "loop-demo": "tsx scripts/run-loop-demo.ts",
+    "agent": "tsx scripts/run-agent.ts",
     "test": "tsx --test tests/**/*.test.ts"
   },
   "keywords": [],

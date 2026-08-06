@@ -1,0 +1,11 @@
+[Unit]
+Description=Delphi Agent Arena — watchdog (restarts delphi-agent.service if wedged)
+After=delphi-agent.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=DELPHI_AGENT_DIR=/opt/delphi-agent
+Environment=DELPHI_AGENT_SERVICE=delphi-agent
+Environment=WATCHDOG_MAX_STALL_SECONDS=1800
+ExecStart=/opt/delphi-agent/deploy/watchdog.sh

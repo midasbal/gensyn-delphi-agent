@@ -33,6 +33,7 @@ import { fetchOpenMarkets } from "../markets/fetch.js";
 import { pollOnce } from "../layers/latency/index.js";
 import { loop as loopConfig, layers } from "../config/index.js";
 import { loadPersistedState, persistState } from "../persistence/index.js";
+import { writeHeartbeat } from "./heartbeat.js";
 import type { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 
 const MIN_EVENT_WAKEUP_INTERVAL_MS = 10_000; // cooldown against threshold jitter
@@ -142,6 +143,7 @@ export async function runLoop(options: LoopOptions = {}): Promise<void> {
   let triggeredBy: LoopTickResult["triggeredBy"] = "initial";
 
   while (options.maxTicks === undefined || ticks < options.maxTicks) {
+    await writeHeartbeat(`tick-start:${triggeredBy}`).catch(() => {});
     let passResult: PaperPassResult | null = null;
     let error: string | null = null;
     try {
@@ -153,6 +155,7 @@ export async function runLoop(options: LoopOptions = {}): Promise<void> {
       error = err instanceof Error ? err.message : String(err);
       onLog("error", `pass failed after ${maxRetries} retries: ${error} — waiting for next tick`);
     }
+    await writeHeartbeat(`tick-end:${triggeredBy}`).catch(() => {});
 
     await options.onTick?.({ triggeredBy, passResult, error });
     ticks++;

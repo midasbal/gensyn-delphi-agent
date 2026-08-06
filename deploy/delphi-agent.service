@@ -1,0 +1,40 @@
+[Unit]
+Description=Delphi Agent Arena — delphi-agent (autonomous trading agent)
+Documentation=file:///opt/delphi-agent/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Fill these in for your VPS (see README.md "Deploying on a VPS") ---
+User=delphi
+WorkingDirectory=/opt/delphi-agent
+# nvm-installed Node has no fixed system path and systemd's minimal PATH
+# won't see nvm shims — use the absolute path from `which node` (run that
+# AFTER `nvm use`, as the deploy user) rather than relying on PATH here.
+ExecStart=/usr/bin/node --import tsx/esm scripts/run-agent.ts
+EnvironmentFile=/opt/delphi-agent/.env
+
+# --- Auto-restart on crash (any nonzero exit, or being killed) ---
+# Deliberately NOT "on-failure" — a clean `systemctl stop` still shouldn't
+# restart, but a watchdog-triggered `SIGKILL` (see delphi-agent-watchdog.*
+# below) must, and "always" covers that; StartLimitIntervalSec/Burst below
+# stop a true crash-loop from restarting forever.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# --- Standard hardening; loosen only if your distro's systemd is old enough to reject one of these ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/delphi-agent/state /opt/delphi-agent/logs
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=delphi-agent
+
+[Install]
+WantedBy=multi-user.target

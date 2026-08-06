@@ -47,6 +47,7 @@ import { executeTrade } from "../execution/paperTrade.js";
 import { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 import { activity, layers } from "../config/index.js";
 import { logDecision } from "../logging/index.js";
+import { writeHeartbeat } from "./heartbeat.js";
 import type { NormalizedMarket } from "../markets/types.js";
 import type { ConsensusMatch } from "../signals/consensus/types.js";
 import type { StructuredResolution } from "../signals/forecasting/types.js";
@@ -112,6 +113,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
   for (const market of fetchedMarkets) {
     const { match } = await findConsensusMatch(market);
     consensusByAddress.set(market.address, match);
+    await writeHeartbeat(`consensus:${market.address}`).catch(() => {});
   }
 
   // --- Layer A: pure move-check reusing the consensus/price data above (no extra API calls), then reorder the queue ---
@@ -130,6 +132,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
   const structuredByAddress = new Map<string, StructuredResolution>();
   for (const market of markets) {
     structuredByAddress.set(market.address, await structureResolution(market));
+    await writeHeartbeat(`structure:${market.address}`).catch(() => {});
   }
 
   // --- Layer B: classify long-tail (feeds F2 ranking below) ---
@@ -149,7 +152,9 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       positionHeld: [...portfolio.positions.values()].some((p) => p.marketAddress === market.address),
       lastForecastAtMs: getLastForecastTimeMs(market.address),
     }));
-  const governedOutcomes = await runForecastGovernor(forecastCandidates, forecastProbability);
+  const governedOutcomes = await runForecastGovernor(forecastCandidates, forecastProbability, (marketAddress) => {
+    void writeHeartbeat(`forecast:${marketAddress}`).catch(() => {});
+  });
   const forecastByAddress = new Map(governedOutcomes.map((o) => [o.market.address, o]));
 
   // --- Layer C, within-market: log-only, reusing the Phase 1 epsilon check ---
@@ -164,6 +169,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
   const decisions: MarketDecisionLog[] = [];
 
   for (const market of markets) {
+    await writeHeartbeat(`decide:${market.address}`).catch(() => {});
     const consensus = consensusByAddress.get(market.address) ?? null;
     const governed = forecastByAddress.get(market.address);
     const forecast = governed?.result ?? null;
