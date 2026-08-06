@@ -18,7 +18,12 @@
  * Caches by a hash of the inputs that would actually change the answer
  * (question, outcomes, resolvesAt, structured fields) so a market whose
  * inputs haven't changed since the last pass is NOT re-forecast — this
- * matters a lot against Groq's free-tier rate limits (30 req/min).
+ * matters a lot against Groq's free-tier rate limits (30 req/min). F2 adds
+ * a second, independent trigger: even with UNCHANGED inputs, a cached
+ * result older than forecastBudget.forecastStalenessMinutes is treated as
+ * stale and re-forecast — the world can move without the question text
+ * changing (e.g. new evidence appearing). Re-forecasting happens on input
+ * change OR staleness, not on every loop pass.
  *
  * Per-outcome nulls are allowed by the prompt contract (the model may only
  * be able to estimate some outcomes) — that maps directly onto
@@ -28,8 +33,10 @@
 import type { NormalizedMarket } from "../../markets/types.js";
 import type { StructuredResolution, ForecastResult } from "./types.js";
 import type { OutcomeEstimate } from "../types.js";
-import { isLLMConfigured, callLLM, extractJson, getLastLLMCallStatus, type LLMCallStatus } from "./llmClient.js";
+import { isLLMConfigured, callLLM, extractJson, getLastLLMCallStatus, getLastTokensUsed, type LLMCallStatus } from "./llmClient.js";
 import { isSearchConfigured, search } from "./searchProvider.js";
+import { recordTokenUsage } from "./tokenBudget.js";
+import { forecastBudget } from "../../config/index.js";
 
 const TEMPERATURE = 0.2;
 const SUM_TOLERANCE = 0.05;
@@ -144,7 +151,17 @@ function parseAndValidate(text: string, outcomeCount: number): ForecastResult | 
   };
 }
 
-const cache = new Map<string, { inputHash: string; result: ForecastResult }>();
+interface CacheEntry {
+  inputHash: string;
+  result: ForecastResult;
+  cachedAtMs: number;
+}
+const cache = new Map<string, CacheEntry>();
+
+/** For F2's staleness ranking (forecastGovernor.ts) — null if never forecast. */
+export function getLastForecastTimeMs(marketAddress: string): number | null {
+  return cache.get(marketAddress)?.cachedAtMs ?? null;
+}
 
 function hashInputs(market: NormalizedMarket, structured: StructuredResolution): string {
   return JSON.stringify({
@@ -176,7 +193,9 @@ export async function forecastProbability(
 
   const inputHash = hashInputs(market, structured);
   const cached = cache.get(market.address);
-  if (cached && cached.inputHash === inputHash) {
+  const stalenessMs = forecastBudget.forecastStalenessMinutes * 60_000;
+  const isStale = cached ? Date.now() - cached.cachedAtMs >= stalenessMs : true;
+  if (cached && cached.inputHash === inputHash && !isStale) {
     lastOutcomeStatus = "cached";
     return cached.result;
   }
@@ -197,6 +216,8 @@ export async function forecastProbability(
 
   let text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
   const callStatus = getLastLLMCallStatus();
+  const tokensUsed1 = getLastTokensUsed();
+  if (tokensUsed1 !== null) recordTokenUsage(tokensUsed1);
   if (!text) {
     // Network/config/rate-limit failure — already retried at the network layer (backoff). Not the "malformed JSON" case.
     lastOutcomeStatus = callStatus ?? "error";
@@ -209,6 +230,8 @@ export async function forecastProbability(
     // Malformed JSON — retry once with a fresh call, per instruction. Never guess past this.
     for (let attempt = 0; attempt < MALFORMED_JSON_RETRIES && !result; attempt++) {
       text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
+      const tokensUsed2 = getLastTokensUsed();
+      if (tokensUsed2 !== null) recordTokenUsage(tokensUsed2);
       if (!text) {
         lastOutcomeStatus = getLastLLMCallStatus() ?? "error";
         return null;
@@ -222,7 +245,7 @@ export async function forecastProbability(
   }
 
   result.sourcesUsed = sourcesUsed;
-  cache.set(market.address, { inputHash, result });
+  cache.set(market.address, { inputHash, result, cachedAtMs: Date.now() });
   lastOutcomeStatus = "ok";
   return result;
 }

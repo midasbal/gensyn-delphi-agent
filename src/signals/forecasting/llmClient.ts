@@ -45,10 +45,30 @@ const MAX_BACKOFF_MS = 8_000;
 
 export type LLMCallStatus = "ok" | "unconfigured" | "rate_limited" | "error";
 let lastCallStatus: LLMCallStatus | null = null;
+let lastRateLimitHeaders: Record<string, string> | null = null;
+let lastTokensUsed: number | null = null;
 
 /** For reporting/observability only — does not change callLLM's contract. */
 export function getLastLLMCallStatus(): LLMCallStatus | null {
   return lastCallStatus;
+}
+
+/** Every x-ratelimit-* response header from the most recent call — this is how F2 discovers the REAL provider limits rather than assuming them. Null until at least one call has been made. */
+export function getLastRateLimitHeaders(): Record<string, string> | null {
+  return lastRateLimitHeaders;
+}
+
+/** Total tokens (prompt+completion) reported by the provider's `usage` field for the most recent successful call, for F2's token-budget tracking. Null if unavailable (unconfigured/errored/provider omitted usage). */
+export function getLastTokensUsed(): number | null {
+  return lastTokensUsed;
+}
+
+function captureRateLimitHeaders(res: Response): void {
+  const headers: Record<string, string> = {};
+  res.headers.forEach((value, key) => {
+    if (key.toLowerCase().startsWith("x-ratelimit-")) headers[key] = value;
+  });
+  lastRateLimitHeaders = Object.keys(headers).length > 0 ? headers : lastRateLimitHeaders;
 }
 
 export function isLLMConfigured(): boolean {
@@ -106,6 +126,7 @@ async function callAnthropic(system: string, user: string, temperature?: number)
     lastCallStatus = "error";
     return null;
   }
+  captureRateLimitHeaders(res);
   if (res.status === 429) {
     lastCallStatus = "rate_limited";
     return null;
@@ -114,8 +135,12 @@ async function callAnthropic(system: string, user: string, temperature?: number)
     lastCallStatus = "error";
     return null;
   }
-  const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+  const data = (await res.json()) as {
+    content?: Array<{ type: string; text?: string }>;
+    usage?: { input_tokens?: number; output_tokens?: number };
+  };
   const textBlock = data.content?.find((b) => b.type === "text");
+  lastTokensUsed = data.usage ? (data.usage.input_tokens ?? 0) + (data.usage.output_tokens ?? 0) : null;
   lastCallStatus = "ok";
   return textBlock?.text ?? null;
 }
@@ -142,6 +167,7 @@ async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: str
     lastCallStatus = "error";
     return null;
   }
+  captureRateLimitHeaders(res);
   if (res.status === 429) {
     lastCallStatus = "rate_limited";
     return null;
@@ -150,7 +176,11 @@ async function callOpenAiCompatible(baseUrl: string, apiKey: string, system: str
     lastCallStatus = "error";
     return null;
   }
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { total_tokens?: number };
+  };
+  lastTokensUsed = data.usage?.total_tokens ?? null;
   lastCallStatus = "ok";
   return data.choices?.[0]?.message?.content ?? null;
 }

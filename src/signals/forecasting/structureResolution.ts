@@ -10,10 +10,19 @@
  * structuredByLLM: false, so downstream consumers can see the provenance and
  * discount confidence accordingly rather than trusting it as if an LLM had
  * reasoned about it.
+ *
+ * F2 caching: a market's question/outcomes/timing never change after
+ * creation, so a SUCCESSFUL (structuredByLLM: true) structuring is cached
+ * permanently per market address and never re-run — no input-hash
+ * invalidation like forecast.ts has, because there's nothing here that's
+ * expected to change. A degraded fallback is deliberately NOT cached: it
+ * cost no tokens to produce, and caching it would permanently lock a market
+ * out of ever getting real structuring later (e.g. once a key is added).
  */
 import type { NormalizedMarket } from "../../markets/types.js";
 import type { StructuredResolution } from "./types.js";
-import { isLLMConfigured, callLLM, extractJson } from "./llmClient.js";
+import { isLLMConfigured, callLLM, extractJson, getLastTokensUsed } from "./llmClient.js";
+import { recordTokenUsage } from "./tokenBudget.js";
 
 const SYSTEM_PROMPT = `You decompose prediction-market resolution questions into structured fields.
 Given a market question, its outcomes, and (if present) a machine-extracted timing phrase, respond with ONLY a JSON object:
@@ -24,6 +33,8 @@ Given a market question, its outcomes, and (if present) a machine-extracted timi
   "sourceOfTruth": "the most likely authoritative source that would be used to settle this, if inferable, else null"
 }
 Do not include any text outside the JSON object.`;
+
+const cache = new Map<string, StructuredResolution>();
 
 function degradedFallback(market: NormalizedMarket): StructuredResolution {
   return {
@@ -37,6 +48,9 @@ function degradedFallback(market: NormalizedMarket): StructuredResolution {
 }
 
 export async function structureResolution(market: NormalizedMarket): Promise<StructuredResolution> {
+  const cached = cache.get(market.address);
+  if (cached) return cached;
+
   if (!isLLMConfigured()) {
     return degradedFallback(market);
   }
@@ -49,6 +63,8 @@ export async function structureResolution(market: NormalizedMarket): Promise<Str
   });
 
   const text = await callLLM(SYSTEM_PROMPT, userPrompt);
+  const tokensUsed = getLastTokensUsed();
+  if (tokensUsed !== null) recordTokenUsage(tokensUsed);
   if (!text) return degradedFallback(market);
 
   const parsed = extractJson<{
@@ -61,7 +77,7 @@ export async function structureResolution(market: NormalizedMarket): Promise<Str
     return degradedFallback(market);
   }
 
-  return {
+  const result: StructuredResolution = {
     subject: parsed.subject,
     condition: parsed.condition,
     comparatorOrThreshold: parsed.comparatorOrThreshold ?? null,
@@ -69,4 +85,6 @@ export async function structureResolution(market: NormalizedMarket): Promise<Str
     resolutionTime: market.resolvesAt ? market.resolvesAt.toISOString() : null,
     structuredByLLM: true,
   };
+  cache.set(market.address, result);
+  return result;
 }

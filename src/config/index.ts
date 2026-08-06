@@ -21,6 +21,13 @@ function requireEnv(name: string): string {
   return value;
 }
 
+/** All *_ENABLED flags default to false — every Phase 4 layer is opt-in, nothing changes behavior until explicitly turned on. */
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  return raw.toLowerCase() === "true" || raw === "1";
+}
+
 const rawMode = (process.env.AGENT_MODE ?? "paper").toLowerCase();
 if (rawMode !== "paper" && rawMode !== "live") {
   throw new Error(`AGENT_MODE must be "paper" or "live", got: ${JSON.stringify(process.env.AGENT_MODE)}`);
@@ -69,12 +76,52 @@ export const risk = {
   dustThresholdTokens: Number(process.env.DUST_THRESHOLD_TOKENS ?? 0.05),
   /** PAPER-mode starting bankroll, in TST. Irrelevant to LIVE (real balance is read from chain). */
   paperStartingBankroll: Number(process.env.PAPER_STARTING_BANKROLL ?? 1000),
+
+  // --- F1: thin-market fill rule (Phase 4) ---
+  /** When false (default), gate f keeps its Phase 3 behavior: hard-skip if the
+   *  desired size can't clear slippage even at the technical floor. When true,
+   *  it steps size down and allows fills below the soft dust floor (but never
+   *  below hardMinShares) as long as the edge still clears at the ACTUAL fill
+   *  price — see execution/thinMarketFill.ts. */
+  thinMarketFillsEnabled: boolEnv("THIN_MARKET_FILLS_ENABLED", false),
+  /** Absolute technical floor (share granularity) — never fill below this, no matter what. */
+  hardMinShares: Number(process.env.HARD_MIN_SHARES ?? 0.01),
+  /** Slippage tolerance as a fraction (0.02 = 2%). Defaults from defaultSlippageBps unless overridden directly. */
+  slippageTolerance: Number(process.env.SLIPPAGE_TOLERANCE ?? Number(process.env.DEFAULT_SLIPPAGE_BPS ?? 200) / 10_000),
 };
 
 // --- Activity-floor constants (Phase 3+ loop enforces these deliberately) ---
 export const activity = {
   minTradesOverWindow: Number(process.env.MIN_TRADES_OVER_WINDOW ?? 10),
   minDistinctMarkets: Number(process.env.MIN_DISTINCT_MARKETS ?? 5),
+};
+
+// --- Phase 4 layer flags. Every layer is opt-in (defaults false) and feeds
+// the risk gate or the signal combiner — none of them ever trades on its own. ---
+export const layers = {
+  // Layer A — latency: consensus-driven requeue, no LLM call on this path.
+  aEnabled: boolEnv("A_ENABLED", false),
+  /** Absolute move in a reference probability (0-1 scale) vs our last-acted value that triggers a requeue. */
+  aReferenceMoveThreshold: Number(process.env.A_REFERENCE_MOVE_THRESHOLD ?? 0.05),
+  aPollSeconds: Number(process.env.A_POLL_SECONDS ?? 30),
+
+  // Layer B — long-tail routing.
+  bEnabled: boolEnv("B_ENABLED", false),
+
+  // Layer C — cross-market coherence.
+  cEnabled: boolEnv("C_ENABLED", false),
+
+  // Layer D — opponent modeling (public subgraph data only).
+  dEnabled: boolEnv("D_ENABLED", false),
+};
+
+// --- F2: forecast token-budget governor (Phase 4). Protects the free Groq
+// tier — set LLM_DAILY_TOKEN_BUDGET below Groq's real cap with margin once
+// the real cap is known from response headers (see llmClient.ts). ---
+export const forecastBudget = {
+  dailyTokenBudget: Number(process.env.LLM_DAILY_TOKEN_BUDGET ?? 80_000),
+  /** Re-forecast a market only after this many minutes, even if inputs are unchanged — not every loop pass. */
+  forecastStalenessMinutes: Number(process.env.FORECAST_STALENESS_MINUTES ?? 30),
 };
 
 // --- Signal source config (Phase 2). Every key here is OPTIONAL — an

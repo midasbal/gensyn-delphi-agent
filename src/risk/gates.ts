@@ -11,6 +11,7 @@ import { risk as riskConfig } from "../config/index.js";
 import { heuristicOracleAmbiguityScorer } from "./oracleAmbiguity.js";
 import { conservativeKellyFraction } from "./kelly.js";
 import { quoteWithSlippageClip } from "../execution/quote.js";
+import { resolveThinMarketFill } from "../execution/thinMarketFill.js";
 import type { GateDecision, TradeCandidate } from "./types.js";
 
 function skipResult(market: NormalizedMarket, gate: "candidate" | "matchQuality" | "oracleAmbiguity" | "edgeThreshold" | "extremes" | "sizing" | "depthSlippage", reason: string): GateDecision {
@@ -94,13 +95,14 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
   // (d) Extremes caution — widen the required edge and shrink size near price 0/1.
   const inExtremeZone = price < riskConfig.extremeZoneMargin || price > 1 - riskConfig.extremeZoneMargin;
   let extremeSizeShrink = 1;
+  let effectiveEdgeThreshold = riskConfig.edgeThreshold;
   if (inExtremeZone) {
-    const widenedThreshold = riskConfig.edgeThreshold * riskConfig.extremeEdgeMultiplier;
-    if (edge < widenedThreshold) {
+    effectiveEdgeThreshold = riskConfig.edgeThreshold * riskConfig.extremeEdgeMultiplier;
+    if (edge < effectiveEdgeThreshold) {
       return skipResult(
         market,
         "extremes",
-        `price ${price.toFixed(4)} is within ${riskConfig.extremeZoneMargin} of 0/1; edge ${edge.toFixed(4)} < widened threshold ${widenedThreshold.toFixed(4)}`
+        `price ${price.toFixed(4)} is within ${riskConfig.extremeZoneMargin} of 0/1; edge ${edge.toFixed(4)} < widened threshold ${effectiveEdgeThreshold.toFixed(4)}`
       );
     }
     extremeSizeShrink = riskConfig.extremeSizeMultiplier;
@@ -114,17 +116,60 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
   const remainingExposureBudget = Math.max(0, riskConfig.maxTotalExposureTokens - ctx.currentTotalExposureTokens);
   desiredTokens = Math.min(desiredTokens, remainingExposureBudget);
 
-  if (desiredTokens < riskConfig.dustThresholdTokens) {
+  // F1 (thinMarketFillsEnabled): the dust-threshold floor is a SOFT policy
+  // minimum this rule is explicitly allowed to fill below — enforcement
+  // moves to gate f's hardMinShares check instead. Phase 3 default
+  // (disabled): unchanged hard skip here.
+  if (!riskConfig.thinMarketFillsEnabled && desiredTokens < riskConfig.dustThresholdTokens) {
     return skipResult(
       market,
       "sizing",
       `sized position ${desiredTokens.toFixed(4)} TST is below dust threshold ${riskConfig.dustThresholdTokens} after Kelly/caps (kellyFraction=${kellyFraction.toFixed(4)}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)})`
     );
   }
+  if (desiredTokens <= 0) {
+    return skipResult(market, "sizing", `sized position is ${desiredTokens.toFixed(4)} TST — nothing to size (remainingExposureBudget=${remainingExposureBudget.toFixed(2)})`);
+  }
 
   const desiredShares = desiredTokens / price;
 
   // (f) Depth/slippage clip — quote the intended size first, always.
+  if (riskConfig.thinMarketFillsEnabled) {
+    const softMinShares = riskConfig.dustThresholdTokens / price;
+    const thin = await resolveThinMarketFill(
+      market.address,
+      outcomeIdx,
+      desiredShares,
+      price,
+      probability,
+      effectiveEdgeThreshold,
+      riskConfig.slippageTolerance,
+      riskConfig.hardMinShares,
+      softMinShares
+    );
+    if (!thin) {
+      return skipResult(
+        market,
+        "depthSlippage",
+        `no size >= hardMinShares (${riskConfig.hardMinShares}) both fit slippage tolerance (${riskConfig.slippageTolerance}) and cleared the edge threshold (${effectiveEdgeThreshold.toFixed(4)}) at its actual fill price`
+      );
+    }
+    return {
+      action: "trade",
+      trade: {
+        ...candidate,
+        desiredShares,
+        kellyFraction,
+        oracleAmbiguityScore: ambiguity.score,
+        oracleAmbiguityRationale: ambiguity.rationale,
+        finalShares: thin.finalShares,
+        finalTokensIn: thin.finalTokensIn,
+        effectivePrice: thin.effectivePrice,
+        slippagePct: thin.slippagePct,
+      },
+    };
+  }
+
   const clip = await quoteWithSlippageClip(market.address, outcomeIdx, desiredShares, price);
   if (!clip) {
     return skipResult(market, "depthSlippage", `quote reverted or slippage exceeded tolerance (${riskConfig.defaultSlippageBps}bps) even after halving down to the minimum size floor`);

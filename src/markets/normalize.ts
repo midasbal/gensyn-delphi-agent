@@ -3,7 +3,8 @@ import type { NormalizedMarket } from "./types.js";
 import { classifyDomain } from "./classify.js";
 import { parseResolution } from "./parseResolution.js";
 
-const PRICE_SUM_EPSILON = 1e-6;
+/** Exported so layers/coherence/withinMarket.ts can reuse the exact same epsilon rather than redefining it. */
+export const PRICE_SUM_EPSILON = 1e-6;
 
 function sumToOne(prices: number[] | null): boolean | null {
   if (!prices || prices.length === 0) return null;

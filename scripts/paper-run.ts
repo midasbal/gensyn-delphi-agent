@@ -7,7 +7,7 @@
  *
  * Usage: npm run paper-run
  */
-import { AGENT_MODE, isLive, risk as riskConfig } from "../src/config/index.js";
+import { AGENT_MODE, isLive, risk as riskConfig, layers as layersConfig, forecastBudget } from "../src/config/index.js";
 import { runPaperPass } from "../src/loop/paperLoop.js";
 import { PaperPortfolio } from "../src/portfolio/paperPortfolio.js";
 import { sweepPosition } from "../src/execution/settlementSweep.js";
@@ -16,21 +16,50 @@ import { executeTrade } from "../src/execution/paperTrade.js";
 import { fetchOpenMarkets } from "../src/markets/fetch.js";
 import type { TradeCandidate } from "../src/risk/types.js";
 
-console.log(`=== PAPER run — AGENT_MODE=${AGENT_MODE} (isLive=${isLive()}) ===\n`);
+console.log(`=== PAPER run — AGENT_MODE=${AGENT_MODE} (isLive=${isLive()}) ===`);
+console.log(
+  `Layers: A=${layersConfig.aEnabled} B=${layersConfig.bEnabled} C=${layersConfig.cEnabled} D=${layersConfig.dEnabled} | F1(thinMarketFills)=${riskConfig.thinMarketFillsEnabled} | F2 dailyTokenBudget=${forecastBudget.dailyTokenBudget} stalenessMin=${forecastBudget.forecastStalenessMinutes}\n`
+);
 
 const portfolio = new PaperPortfolio(riskConfig.paperStartingBankroll);
 const result = await runPaperPass(portfolio);
 
 console.log("=== Per-market decisions ===\n");
 for (const d of result.decisions) {
+  const layerBits: string[] = [];
+  if (d.layers.layerA) layerBits.push(`A:${d.layers.layerA.moved ? "MOVED" : "stable"}`);
+  if (d.layers.layerB) layerBits.push(`B:${d.layers.layerB.isLongTail ? "long-tail" : "not-long-tail"}`);
+  if (d.layers.layerC) layerBits.push(`C:${d.layers.layerC.withinMarketFlagged ? `DRIFT(${d.layers.layerC.drift})` : "ok"}`);
+  if (d.layers.layerD) layerBits.push(`D:${d.layers.layerD.herdingDetected ? (d.layers.layerD.corroborated ? `CORROBORATED(+${d.layers.layerD.confidenceBump.toFixed(2)})` : "herding-but-not-corroborating") : "no-herd"}`);
+  const layerSuffix = layerBits.length > 0 ? ` [${layerBits.join(" ")}]` : "";
+
   if (d.outcome === "traded") {
-    console.log(`[TRADED]      ${d.market.address} | ${d.market.question.slice(0, 70)} | edge=${d.edge?.toFixed(4)}`);
+    console.log(`[TRADED]      ${d.market.address} | ${d.market.question.slice(0, 70)} | edge=${d.edge?.toFixed(4)}${layerSuffix}`);
   } else if (d.outcome === "no-candidate") {
-    console.log(`[NO-SIGNAL]   ${d.market.address} | ${d.market.question.slice(0, 70)} | no outcome with positive edge and a usable signal`);
+    console.log(`[NO-SIGNAL]   ${d.market.address} | ${d.market.question.slice(0, 70)} | no outcome with positive edge and a usable signal${layerSuffix}`);
   } else {
-    console.log(`[SKIP:${d.gate?.padEnd(13)}] ${d.market.address} | ${d.market.question.slice(0, 60)} | edge=${d.edge?.toFixed(4)} | ${d.reason}`);
+    console.log(`[SKIP:${d.gate?.padEnd(13)}] ${d.market.address} | ${d.market.question.slice(0, 60)} | edge=${d.edge?.toFixed(4)} | ${d.reason}${layerSuffix}`);
   }
 }
+
+console.log("\n=== Layer C: cross-market coherence pairs ===\n");
+if (!layersConfig.cEnabled) {
+  console.log("Layer C disabled this run.");
+} else if (result.coherencePairs.length === 0) {
+  console.log("No related pairs found above the logging threshold (overlap >= 0.3) in the live market set.");
+} else {
+  for (const p of result.coherencePairs) {
+    console.log(`${p.marketA} <-> ${p.marketB} | overlap=${p.overlap.toFixed(2)} nearDuplicate=${p.nearDuplicate} flagged=${p.flagged} | ${p.reason}`);
+    if (p.arbitrageExecuted) {
+      console.log(`  -> ARBITRAGE EXECUTED, expected profit ${p.arbitrageProfit?.toFixed(4)} TST`);
+    }
+  }
+}
+
+console.log("\n=== F2: forecast governor ===\n");
+console.log(
+  `Candidates needing a forecast: ${result.forecastGovernor.candidateCount} | forecasted: ${result.forecastGovernor.forecastedCount} | deferred (budget): ${result.forecastGovernor.deferredCount}`
+);
 
 console.log("\n=== Simulated fills ===\n");
 if (portfolio.trades.length === 0) {
