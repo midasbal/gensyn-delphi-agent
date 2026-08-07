@@ -3,6 +3,11 @@ Description=Delphi Agent Arena — delphi-agent (autonomous trading agent)
 Documentation=file:///opt/delphi-agent/README.md
 After=network-online.target
 Wants=network-online.target
+# StartLimitIntervalSec/Burst belong here in [Unit], not [Service] — systemd
+# 255 logs "Unknown key name ... in section 'Service', ignoring" and silently
+# drops the crash-loop limit if they're placed in [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -19,12 +24,11 @@ EnvironmentFile=/opt/delphi-agent/.env
 # --- Auto-restart on crash (any nonzero exit, or being killed) ---
 # Deliberately NOT "on-failure" — a clean `systemctl stop` still shouldn't
 # restart, but a watchdog-triggered `SIGKILL` (see delphi-agent-watchdog.*
-# below) must, and "always" covers that; StartLimitIntervalSec/Burst below
-# stop a true crash-loop from restarting forever.
+# below) must, and "always" covers that; StartLimitIntervalSec/Burst above
+# (in [Unit] — systemd requires them there, not here) stop a true crash-loop
+# from restarting forever.
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 # --- Standard hardening; loosen only if your distro's systemd is old enough to reject one of these ---
 NoNewPrivileges=true
