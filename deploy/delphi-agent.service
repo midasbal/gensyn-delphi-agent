@@ -35,6 +35,12 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/opt/delphi-agent/state /opt/delphi-agent/logs
 ProtectHome=true
+# Without this, tsx can't create its cache dir under /tmp once systemd
+# clears /tmp on boot (observed live: "ENOENT: mkdir /tmp/tsx-999" on
+# post-reboot start) — PrivateTmp gives the unit its own writable /tmp,
+# fixing that AND tightening isolation further (no shared /tmp with other
+# units).
+PrivateTmp=true
 
 StandardOutput=journal
 StandardError=journal
