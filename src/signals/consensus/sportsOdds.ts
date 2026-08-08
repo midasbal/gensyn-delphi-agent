@@ -30,7 +30,7 @@ import type { NormalizedMarket } from "../../markets/types.js";
 import type { ConsensusAdapter, ConsensusMatch } from "./types.js";
 import { distributionFromSingleOutcome } from "../types.js";
 import { signals } from "../../config/index.js";
-import { wordOverlapScore, dateProximityScore } from "./textMatch.js";
+import { wordOverlapScore, dateProximityScore, extractNumericCondition } from "./textMatch.js";
 import { fetchJsonWithTimeout } from "../../util/fetchJson.js";
 
 const BASE_URL = "https://api.the-odds-api.com/v4/sports";
@@ -39,8 +39,21 @@ const TEXT_THRESHOLD = 0.5;
 const DATE_THRESHOLD_DAYS = 1;
 
 // Small, fixed set to respect the free-tier request budget — one call per
-// key per market evaluated. Extend deliberately, not automatically.
-const SPORT_KEYS = ["soccer_epl", "soccer_usa_mls", "americanfootball_nfl", "basketball_nba", "baseball_mlb", "icehockey_nhl"];
+// key per market evaluated. Extend deliberately, not automatically: each
+// addition here should be a league confirmed live against
+// /v4/sports (bug fix, live testing on the real market set: CFL is
+// covered — key confirmed via /v4/sports — but was missing here, so a
+// real CFL market never even got queried, regardless of team-name
+// matching).
+const SPORT_KEYS = [
+  "soccer_epl",
+  "soccer_usa_mls",
+  "americanfootball_nfl",
+  "americanfootball_cfl",
+  "basketball_nba",
+  "baseball_mlb",
+  "icehockey_nhl",
+];
 
 interface OddsOutcome {
   name: string;
@@ -90,6 +103,16 @@ export const sportsOddsAdapter: ConsensusAdapter = {
   async match(market: NormalizedMarket): Promise<ConsensusMatch | null> {
     if (!signals.oddsApiKey) return null;
     if (!/sport/i.test(market.domain)) return null;
+
+    // h2h/moneyline framing only (see file header). A numeric threshold in
+    // the question — over/under totals ("combine for 56+ points"), prop-bet
+    // stat ranges, etc. — means this isn't a simple two-way "who wins"
+    // market, and h2h odds can't answer it: team names would still overlap
+    // and the date would still match, so without this guard a covered
+    // league's totals/prop market would get silently, wrongly matched with
+    // a "which team wins" probability standing in for a completely
+    // different question. Bucketed-range markets are polymarket.ts's job.
+    if (extractNumericCondition(market.question)) return null;
 
     for (const sportKey of SPORT_KEYS) {
       const url = `${BASE_URL}/${sportKey}/odds?apiKey=${signals.oddsApiKey}&regions=us&markets=h2h`;
