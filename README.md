@@ -295,8 +295,8 @@ every single market in the consensus/structuring/forecasting/decision loops
 `delphi-agent-watchdog.timer`, checks that file's age; if it's stale beyond
 `WATCHDOG_MAX_STALL_SECONDS` (default 1800s / 30 min — comfortably above the
 bounded worst case of a single pass under sustained rate-limiting, roughly
-10-15 minutes with the Phase 5A retry-after cap), it hard-restarts
-`delphi-agent.service`.
+20 minutes with the Phase 5A retry-after cap and Fix 2's raised 45s
+per-call LLM timeout), it hard-restarts `delphi-agent.service`.
 
 Verified locally (dry-run, no real systemd unit needed for this check):
 

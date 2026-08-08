@@ -24,9 +24,12 @@ APP_DIR="${DELPHI_AGENT_DIR:-/opt/delphi-agent}"
 SERVICE_NAME="${DELPHI_AGENT_SERVICE:-delphi-agent}"
 # 30 minutes: comfortably above the bounded worst case of a single pass under
 # sustained 429s (10 markets x ~4 retries x 8s-capped backoff each, in both
-# the structuring and forecasting loops — see llmClient.ts's MAX_BACKOFF_MS)
-# — roughly 10-15 minutes worst case — while still catching a genuine wedge
-# well before it silently eats an entire loop cadence.
+# the structuring and forecasting loops — see llmClient.ts's MAX_BACKOFF_MS),
+# OR under llmClient.ts's 45s per-call hard timeout (Fix 2, raised from 30s
+# to absorb search-augmented prompt latency; a genuine non-429 hang gets no
+# retry, so this is the real per-call ceiling in that case) — roughly 20
+# minutes worst case across a full pass — while still catching a genuine
+# wedge well before it silently eats an entire loop cadence.
 MAX_STALL_SECONDS="${WATCHDOG_MAX_STALL_SECONDS:-1800}"
 HEARTBEAT_FILE="$APP_DIR/state/heartbeat.json"
 

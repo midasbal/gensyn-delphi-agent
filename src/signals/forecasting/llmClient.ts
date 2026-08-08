@@ -38,7 +38,20 @@
  */
 import { signals } from "../../config/index.js";
 
-const FETCH_TIMEOUT_MS = 30_000;
+// Fix 2 (pre-launch live testing on the real market set): with
+// SEARCH_API_KEY set, forecast.ts's evidence-augmented prompt is heavier
+// than the plain (no-search) prompt this project was originally calibrated
+// against — under back-to-back, unpaced load (many markets in a row, no
+// gap between calls) that pushed several later calls into "call/parse
+// failed" territory. A slow-but-otherwise-healthy response (higher
+// queue_time/generation time under load, not a 429) is NEVER retried by
+// fetchWithBackoff below — a single hard-timeout kills the whole call with
+// zero retry — so 30s was too tight a margin for that case. Raised to 45s
+// to absorb realistic latency variance under load; this does NOT change
+// the persistent-429 worst case (bounded by MAX_RETRIES/backoff below, not
+// this constant) — see README.md's watchdog section for the updated
+// worst-case-pass estimate this timeout feeds into.
+const FETCH_TIMEOUT_MS = 45_000;
 const MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 8_000;
@@ -72,23 +85,28 @@ export function isLLMConfigured(): boolean {
  * Observed live (Phase 5 checkpoint): AbortController.abort() does not
  * reliably unblock an in-flight fetch() in this environment — a stuck
  * request can hang well past FETCH_TIMEOUT_MS with the abort signal fired
- * and ignored. Racing fetch() against an independent timer is the backstop:
- * it can't cancel the underlying request (that's still AbortController's
- * job, kept below as a best-effort), but it guarantees this function itself
- * never blocks the caller past FETCH_TIMEOUT_MS regardless of what the
- * fetch promise does.
- */
-function timeoutRejection(ms: number): Promise<never> {
-  return new Promise((_, reject) => setTimeout(() => reject(new Error("fetch-hard-timeout")), ms));
-}
-
-/**
- * Same backstop as fetchWithBackoff, but for reading the response body:
- * headers can arrive while the body stream stalls, and that's a separate
- * hang from the one AbortController is (unreliably) wired to above.
+ * and ignored. Racing a promise against an independent timer is the
+ * backstop: it can't cancel the underlying request (that's still
+ * AbortController's job, kept in fetchWithBackoff below as a best-effort),
+ * but it guarantees the caller never blocks past `ms` regardless of what
+ * the raced promise does. Used both for the initial fetch() and — same
+ * backstop, different hang — for reading the response body afterward
+ * (headers can arrive while the body stream stalls).
+ *
+ * Fix 2 hardening: always clears its own timer via `finally`, regardless
+ * of which side of the race settles first — the original version's timer
+ * leaked whenever the real operation won (harmless most of the time, but
+ * it meant every fast-resolving call still left a dangling timer alive
+ * for the full `ms`, which became a real problem once FETCH_TIMEOUT_MS was
+ * raised to 45s as part of this same fix: it was tripling this project's
+ * test-suite wall-clock time).
  */
 function withHardTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([promise, timeoutRejection(ms)]);
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("fetch-hard-timeout")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function fetchWithBackoff(url: string, init: RequestInit): Promise<Response | null> {
@@ -97,7 +115,7 @@ async function fetchWithBackoff(url: string, init: RequestInit): Promise<Respons
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     let res: Response;
     try {
-      res = await Promise.race([fetch(url, { ...init, signal: controller.signal }), timeoutRejection(FETCH_TIMEOUT_MS)]);
+      res = await withHardTimeout(fetch(url, { ...init, signal: controller.signal }), FETCH_TIMEOUT_MS);
     } catch {
       clearTimeout(timeout);
       return null;

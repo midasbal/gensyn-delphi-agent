@@ -26,11 +26,25 @@ const MINUTE_MS = 60 * 1000;
 // Calibrated against a real live Groq forecast call (Phase 4): measured
 // usage.total_tokens was 863 for one forecastProbability() call against a
 // live competition market (llama-3.3-70b-versatile, this project's actual
-// system+user prompt). Rounded up to 900 so both the daily and per-minute
-// budgets are conservative about how many calls they think they can afford.
+// system+user prompt), WITHOUT search evidence in the prompt.
+//
+// Fix 2 (pre-launch live testing): with SEARCH_API_KEY set, the prompt
+// carries an extra evidence block (forecast.ts's MAX_EVIDENCE_ITEMS *
+// MAX_SNIPPET_CHARS, plus per-item title/url text) that the 863-token
+// baseline didn't account for — this constant is used to PACE calls
+// BEFORE they're made (throttleForRateLimit below), so an estimate that's
+// too low under-throttles and lets more real calls through per minute than
+// Groq's actual cap allows, which is exactly the rate-limit pressure
+// observed under back-to-back, search-on load. Raised from 900 to cover
+// the worst case (base prompt + max trimmed evidence: 2 items * 200 chars
+// + title/url overhead, roughly another ~150 tokens) with margin. This is
+// a single shared estimate for both search-on and search-off — slightly
+// over-conservative when search is off, which is a safe direction to be
+// wrong in for a self-imposed pacing budget.
+//
 // Lives here (not forecastGovernor.ts) so both it and forecast.ts's
 // per-call rate limiter can import one canonical value without a cycle.
-export const ESTIMATED_TOKENS_PER_FORECAST = 900;
+export const ESTIMATED_TOKENS_PER_FORECAST = 1100;
 
 // Groq's real per-minute token cap, confirmed live from x-ratelimit-limit-tokens.
 const GROQ_TOKENS_PER_MINUTE_LIMIT = 12_000;

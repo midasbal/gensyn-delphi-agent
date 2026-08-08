@@ -41,11 +41,17 @@ const TEMPERATURE = 0.2;
 const SUM_TOLERANCE = 0.05;
 const MALFORMED_JSON_RETRIES = 1;
 
-// Evidence trimming (Phase 5 carry-forward correction): cap how much search
-// context rides in each prompt, keeping calls lean and predictable for the
-// per-minute token-rate limiter below.
-const MAX_EVIDENCE_ITEMS = 3;
-const MAX_SNIPPET_CHARS = 300;
+// Evidence trimming: cap how much search context rides in each prompt,
+// keeping calls lean and predictable for the per-minute token-rate limiter
+// below. Fix 2 (pre-launch live testing): trimmed harder than the original
+// Phase 5 values (was 3 items / 300 chars) after back-to-back, unpaced
+// forecasting with search on pushed several later calls into timeout/
+// rate-limit territory — a smaller evidence-augmented prompt both
+// generates faster (less risk of tripping llmClient.ts's own timeout) and
+// keeps real per-call token usage closer to what
+// tokenBudget.ts's ESTIMATED_TOKENS_PER_FORECAST assumes for pacing.
+const MAX_EVIDENCE_ITEMS = 2;
+const MAX_SNIPPET_CHARS = 200;
 
 const SYSTEM_PROMPT = `You are a calibrated forecasting engine for prediction markets. Your only job is
 to estimate the true probability of each outcome as accurately and honestly as
@@ -228,9 +234,18 @@ export async function forecastProbability(
   let searchContext = "none available";
   let sourcesUsed: string[] = [];
   if (isSearchConfigured()) {
+    // Fix 2: search() (searchProvider.ts) already never throws — it's built
+    // on fetchJsonWithTimeout, which resolves to null on ANY failure
+    // (network error, timeout, non-ok status, malformed JSON) rather than
+    // rejecting. So a Tavily timeout/failure here is structurally
+    // indistinguishable from "search returned zero results": both fall
+    // through to the "none available" branch below and the LLM call still
+    // proceeds normally — a slow/failed search degrades the EVIDENCE
+    // quality of this forecast, it does not fail the forecast itself. See
+    // tests/forecastSearchDegradation.test.ts for a pinning test of this.
     const results = await search(market.question);
     if (results && results.length > 0) {
-      // Evidence trimming (Phase 5 carry-forward correction): top-N only, each snippet capped — keeps every call lean and predictable for the per-minute rate limiter below.
+      // Evidence trimming: top-N only, each snippet capped — keeps every call lean and predictable for the per-minute rate limiter below.
       const trimmed = results.slice(0, MAX_EVIDENCE_ITEMS);
       searchContext = trimmed.map((r) => `- ${r.title} (${r.url}): ${r.snippet.slice(0, MAX_SNIPPET_CHARS)}`).join("\n");
       sourcesUsed = trimmed.map((r) => r.url);
