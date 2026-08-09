@@ -58,11 +58,21 @@ export interface UsageEntry {
 
 let usageLog: UsageEntry[] = [];
 
+/**
+ * Bug fix: previously a `while (usageLog[0].timestampMs < cutoff) shift()`
+ * loop — correct only as long as usageLog stays sorted ascending, an
+ * invariant nothing here actually enforced or asserted. Rewritten as an
+ * unconditional filter: independent of array order, and correct even if a
+ * future change (or a hand-edited/replayed state file via importUsageLog)
+ * ever produces an out-of-order log. Called from every budget-computation
+ * entrypoint below (tokensUsedInWindow, remainingBudget, hasBudgetFor) —
+ * not just recordTokenUsage/importUsageLog — so a stale entry ages out of
+ * the very next check that runs after it crosses 24h old, with no restart
+ * required.
+ */
 function pruneOld(now: number): void {
   const cutoff = now - DAY_MS; // the 24h window is the longest we track — pruning to it also bounds the 1-minute window's lookups
-  while (usageLog.length > 0 && usageLog[0]!.timestampMs < cutoff) {
-    usageLog.shift();
-  }
+  usageLog = usageLog.filter((e) => e.timestampMs >= cutoff);
 }
 
 export function recordTokenUsage(tokens: number, nowMs: number = Date.now()): void {
@@ -83,7 +93,9 @@ export function tokensUsedInLast24h(nowMs: number = Date.now()): number {
   return tokensUsedInWindow(DAY_MS, nowMs);
 }
 
+/** Prunes THEN computes — every caller (F2's governor, print-signals, etc.) gets an up-to-date figure regardless of how long it's been since the last recordTokenUsage/importUsageLog call. */
 export function remainingBudget(nowMs: number = Date.now()): number {
+  pruneOld(nowMs);
   return Math.max(0, forecastBudget.dailyTokenBudget - tokensUsedInLast24h(nowMs));
 }
 
@@ -113,7 +125,14 @@ export function exportUsageLog(): UsageEntry[] {
   return [...usageLog];
 }
 
-/** For persistence/index.ts, on startup load. Replaces the in-memory log entirely. */
+/**
+ * For persistence/index.ts, on startup load (loadPersistedState).
+ * Replaces the in-memory log entirely, THEN prunes — a restart never
+ * resurrects entries that had already aged out before the process was
+ * last stopped, and a log that sat untouched (process down) past the
+ * window is trimmed immediately on the very next boot rather than
+ * waiting for the first recordTokenUsage/budget check.
+ */
 export function importUsageLog(entries: UsageEntry[], nowMs: number = Date.now()): void {
   usageLog = entries.filter((e) => typeof e.timestampMs === "number" && typeof e.tokens === "number");
   pruneOld(nowMs);

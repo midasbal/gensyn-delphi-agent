@@ -60,6 +60,78 @@ test("tokenBudget — prunes entries older than 24h", () => {
   assert.equal(tokensUsedInLast24h(now + DAY + 1), 0);
 });
 
+test("tokenBudget — a usage log imported entirely from >24h-old entries (e.g. from a persisted state file after a long-idle process) yields full remaining budget, without any recordTokenUsage call", () => {
+  resetTokenBudget();
+  const now = 4_000_000_000_000;
+  const DAY = 24 * 60 * 60 * 1000;
+  // Simulates loadPersistedState() importing state/agent-state.json's
+  // tokenUsageLog after the process was down/idle past the window — every
+  // entry is already stale by the time it's loaded.
+  importUsageLog(
+    [
+      { timestampMs: now - DAY - 1, tokens: 40_000 },
+      { timestampMs: now - DAY - 60_000, tokens: 30_000 },
+      { timestampMs: now - 2 * DAY, tokens: 20_000 },
+    ],
+    now
+  );
+  assert.equal(tokensUsedInLast24h(now), 0);
+  assert.equal(remainingBudget(now), forecastBudget.dailyTokenBudget);
+  assert.equal(hasBudgetFor(forecastBudget.dailyTokenBudget), true);
+});
+
+test("tokenBudget — a mix of stale (>24h) and recent entries counts only the recent ones toward the budget", () => {
+  resetTokenBudget();
+  const now = 5_000_000_000_000;
+  const DAY = 24 * 60 * 60 * 1000;
+  importUsageLog(
+    [
+      { timestampMs: now - 2 * DAY, tokens: 90_000 }, // stale — must NOT count
+      { timestampMs: now - DAY - 1, tokens: 90_000 }, // stale by 1ms — must NOT count
+      { timestampMs: now - 60_000, tokens: 1_000 }, // recent — must count
+      { timestampMs: now - 1, tokens: 500 }, // recent — must count
+    ],
+    now
+  );
+  assert.equal(tokensUsedInLast24h(now), 1500);
+  assert.equal(remainingBudget(now), forecastBudget.dailyTokenBudget - 1500);
+});
+
+test("tokenBudget — the governor recovers on its own as entries age out, with no restart (no recordTokenUsage/importUsageLog call in between checks)", () => {
+  resetTokenBudget();
+  const now = 6_000_000_000_000;
+  const DAY = 24 * 60 * 60 * 1000;
+  // A log that would exhaust the whole daily budget IF it were all still within the window.
+  importUsageLog([{ timestampMs: now, tokens: forecastBudget.dailyTokenBudget }], now);
+  assert.equal(hasBudgetFor(1, now), false, "budget should be exhausted right after import");
+
+  // No new recordTokenUsage/importUsageLog call — only time passing and a fresh budget check,
+  // exactly like a long-running process's next loop tick calling hasBudgetFor() again.
+  const justBeforeWindowCloses = now + DAY - 1;
+  assert.equal(hasBudgetFor(1, justBeforeWindowCloses), false, "still within the 24h window");
+
+  const justAfterWindowCloses = now + DAY + 1;
+  assert.equal(hasBudgetFor(1, justAfterWindowCloses), true, "the single old entry should have aged out, freeing the budget without any restart");
+  assert.equal(remainingBudget(justAfterWindowCloses), forecastBudget.dailyTokenBudget);
+});
+
+test("tokenBudget — pruning is independent of array order (defensive: a hand-edited or replayed state file need not be sorted)", () => {
+  resetTokenBudget();
+  const now = 7_000_000_000_000;
+  const DAY = 24 * 60 * 60 * 1000;
+  // Deliberately NOT in ascending timestamp order.
+  importUsageLog(
+    [
+      { timestampMs: now - 1000, tokens: 500 }, // recent
+      { timestampMs: now - 2 * DAY, tokens: 90_000 }, // stale, but sorted BEFORE a recent entry above
+      { timestampMs: now - 3 * DAY, tokens: 90_000 }, // stale
+      { timestampMs: now - 2000, tokens: 700 }, // recent
+    ],
+    now
+  );
+  assert.equal(tokensUsedInLast24h(now), 1200, "only the two recent entries should count, regardless of their position in the array");
+});
+
 test("tokenBudget — remainingBudget and hasBudgetFor reflect the configured daily budget", () => {
   resetTokenBudget();
   const now = 2_000_000_000_000;
