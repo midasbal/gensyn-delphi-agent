@@ -19,6 +19,16 @@
  * the ambient .env for this project (used throughout the test suite's
  * other live-adjacent checks); this test does not depend on its exact
  * value, only that isLLMConfigured() is true.
+ *
+ * CONDITIONAL_SEARCH_ENABLED=false, deliberately: these tests predate and
+ * specifically target the SIMPLE "search unconditionally, then one
+ * forecast call" path forecast.ts still uses when conditional search is
+ * off — not the newer two-stage gate (see tests/forecastConditionalSearch
+ * .test.ts for that). Without forcing this false, the conditional-search
+ * default (on) would mean stage 2 often never fires at all for this
+ * file's mocked confidence/price values, and these tests would pass
+ * vacuously (sourcesUsed==0 because search was never reached, not because
+ * it degraded) rather than actually exercising graceful degradation.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -26,6 +36,7 @@ import type { NormalizedMarket } from "../src/markets/types.js";
 import type { StructuredResolution } from "../src/signals/forecasting/types.js";
 
 process.env.SEARCH_API_KEY = "test-search-key";
+process.env.CONDITIONAL_SEARCH_ENABLED = "false";
 const { forecastProbability } = await import("../src/signals/forecasting/forecast.js");
 const { isSearchConfigured } = await import("../src/signals/forecasting/searchProvider.js");
 const { isLLMConfigured } = await import("../src/signals/forecasting/llmClient.js");

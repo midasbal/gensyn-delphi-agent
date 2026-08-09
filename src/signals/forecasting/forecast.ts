@@ -28,6 +28,15 @@
  * be able to estimate some outcomes) — that maps directly onto
  * signals/types.ts's OutcomeEstimate, which was already designed to allow a
  * partial per-outcome distribution.
+ *
+ * CONDITIONAL SEARCH (forecastBudget.conditionalSearchEnabled, default on):
+ * when SEARCH_API_KEY is configured, a cheap no-search forecast runs FIRST;
+ * a second, search-augmented re-forecast only fires if that cheap result is
+ * both low-confidence AND already implies a tradeable edge vs the market
+ * price — see shouldRunSearchAugmented() below. Sharpening an already-
+ * confident or already-price-agreeing forecast with search would spend
+ * tokens without changing any downstream decision. Disabling this flag
+ * restores the simpler "always search when configured, one call" behavior.
  */
 import type { NormalizedMarket } from "../../markets/types.js";
 import type { StructuredResolution, ForecastResult } from "./types.js";
@@ -213,6 +222,88 @@ function hashInputs(market: NormalizedMarket, structured: StructuredResolution):
 type ForecastOutcomeStatus = LLMCallStatus | "cached" | "parse_failed";
 let lastOutcomeStatus: ForecastOutcomeStatus | null = null;
 
+/** Runs Tavily (if configured) and builds the trimmed evidence block + source list for a prompt. Never throws — see the graceful-degradation note on its caller(s). */
+async function buildSearchContext(market: NormalizedMarket): Promise<{ searchContext: string; sourcesUsed: string[] }> {
+  const results = await search(market.question);
+  if (results && results.length > 0) {
+    // Evidence trimming: top-N only, each snippet capped — keeps every call lean and predictable for the per-minute rate limiter below.
+    const trimmed = results.slice(0, MAX_EVIDENCE_ITEMS);
+    return {
+      searchContext: trimmed.map((r) => `- ${r.title} (${r.url}): ${r.snippet.slice(0, MAX_SNIPPET_CHARS)}`).join("\n"),
+      sourcesUsed: trimmed.map((r) => r.url),
+    };
+  }
+  return { searchContext: "none available (search configured but returned no results)", sourcesUsed: [] };
+}
+
+/** One LLM call + malformed-JSON retry, exactly the prior single-call logic — now reusable for both the no-search and search-augmented prompts of the two-stage flow below. Records token usage for every call it actually makes. */
+async function callAndParse(userPrompt: string, outcomeCount: number): Promise<ForecastResult | null> {
+  // Per-minute pacing (Phase 5 carry-forward correction): Groq's binding
+  // limit is 12k tokens/MIN, not the daily figure — this can genuinely
+  // sleep to stay under it with margin, before spending the call.
+  await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
+  let text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
+  const callStatus = getLastLLMCallStatus();
+  const tokensUsed1 = getLastTokensUsed();
+  if (tokensUsed1 !== null) recordTokenUsage(tokensUsed1);
+  if (!text) {
+    // Network/config/rate-limit failure — already retried at the network layer (backoff). Not the "malformed JSON" case.
+    lastOutcomeStatus = callStatus ?? "error";
+    return null;
+  }
+
+  let result = parseAndValidate(text, outcomeCount);
+
+  if (!result) {
+    // Malformed JSON — retry once with a fresh call, per instruction. Never guess past this.
+    for (let attempt = 0; attempt < MALFORMED_JSON_RETRIES && !result; attempt++) {
+      await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
+      text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
+      const tokensUsed2 = getLastTokensUsed();
+      if (tokensUsed2 !== null) recordTokenUsage(tokensUsed2);
+      if (!text) {
+        lastOutcomeStatus = getLastLLMCallStatus() ?? "error";
+        return null;
+      }
+      result = parseAndValidate(text, outcomeCount);
+    }
+    if (!result) {
+      lastOutcomeStatus = "parse_failed";
+      return null;
+    }
+  }
+
+  lastOutcomeStatus = "ok";
+  return result;
+}
+
+/**
+ * Conditional search gate: a search-augmented re-forecast is only worth
+ * its tokens when it could plausibly change what happens next — both:
+ *   (a) LOW CONFIDENCE — the cheap forecast wasn't sure of itself, so more
+ *       evidence has somewhere to actually move the number.
+ *   (b) TRADEABLE EDGE — the cheap forecast already disagrees with the
+ *       market price by enough to matter. If it agrees with the price,
+ *       sharpening the number with search changes no trade decision — see
+ *       risk/gates.ts's own edge-threshold gate, which forecastSearchMinEdge
+ *       defaults to matching.
+ * Uses outcome[0] (the primary/named outcome) for both, the same
+ * convention polymarket.ts/sportsOdds.ts/crypto.ts use for a single
+ * scalar confidence/probability per market. No live price known (spotPrices
+ * unfetched) -> can't confirm tradeable edge -> don't spend the tokens.
+ */
+function shouldRunSearchAugmented(result: ForecastResult, market: NormalizedMarket): boolean {
+  const primary = result.outcomes[0];
+  if (!primary || primary.probability === null) return false;
+  if (primary.confidence >= forecastBudget.forecastSearchConfThreshold) return false;
+
+  const price = market.spotPrices?.[0];
+  if (price === undefined || price === null || Number.isNaN(price)) return false;
+
+  const impliedEdge = Math.abs(primary.probability - price);
+  return impliedEdge >= forecastBudget.forecastSearchMinEdge;
+}
+
 export async function forecastProbability(
   market: NormalizedMarket,
   structured: StructuredResolution
@@ -231,68 +322,56 @@ export async function forecastProbability(
     return cached.result;
   }
 
-  let searchContext = "none available";
-  let sourcesUsed: string[] = [];
-  if (isSearchConfigured()) {
+  // Conditional search OFF (or search not configured at all, in which case
+  // there's nothing to condition on either way): exactly the prior
+  // single-call behavior — search unconditionally, then one forecast call.
+  if (!isSearchConfigured() || !forecastBudget.conditionalSearchEnabled) {
     // Fix 2: search() (searchProvider.ts) already never throws — it's built
     // on fetchJsonWithTimeout, which resolves to null on ANY failure
     // (network error, timeout, non-ok status, malformed JSON) rather than
     // rejecting. So a Tavily timeout/failure here is structurally
     // indistinguishable from "search returned zero results": both fall
-    // through to the "none available" branch below and the LLM call still
+    // through to the "none available" branch and the LLM call still
     // proceeds normally — a slow/failed search degrades the EVIDENCE
     // quality of this forecast, it does not fail the forecast itself. See
     // tests/forecastSearchDegradation.test.ts for a pinning test of this.
-    const results = await search(market.question);
-    if (results && results.length > 0) {
-      // Evidence trimming: top-N only, each snippet capped — keeps every call lean and predictable for the per-minute rate limiter below.
-      const trimmed = results.slice(0, MAX_EVIDENCE_ITEMS);
-      searchContext = trimmed.map((r) => `- ${r.title} (${r.url}): ${r.snippet.slice(0, MAX_SNIPPET_CHARS)}`).join("\n");
-      sourcesUsed = trimmed.map((r) => r.url);
-    } else {
-      searchContext = "none available (search configured but returned no results)";
-    }
+    const { searchContext, sourcesUsed } = isSearchConfigured()
+      ? await buildSearchContext(market)
+      : { searchContext: "none available", sourcesUsed: [] as string[] };
+    const userPrompt = buildUserPrompt(market, structured, searchContext);
+    const result = await callAndParse(userPrompt, market.outcomeCount);
+    if (!result) return null;
+    result.sourcesUsed = sourcesUsed;
+    cache.set(market.address, { inputHash, result, cachedAtMs: Date.now() });
+    return result;
   }
 
-  const userPrompt = buildUserPrompt(market, structured, searchContext);
+  // Conditional search ON: stage 1, the cheap no-search forecast.
+  const cheapPrompt = buildUserPrompt(market, structured, "none available");
+  const cheapResult = await callAndParse(cheapPrompt, market.outcomeCount);
+  if (!cheapResult) return null;
+  cheapResult.sourcesUsed = [];
 
-  // Per-minute pacing (Phase 5 carry-forward correction): Groq's binding
-  // limit is 12k tokens/MIN, not the daily figure — this can genuinely
-  // sleep to stay under it with margin, before spending the call.
-  await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
-  let text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
-  const callStatus = getLastLLMCallStatus();
-  const tokensUsed1 = getLastTokensUsed();
-  if (tokensUsed1 !== null) recordTokenUsage(tokensUsed1);
-  if (!text) {
-    // Network/config/rate-limit failure — already retried at the network layer (backoff). Not the "malformed JSON" case.
-    lastOutcomeStatus = callStatus ?? "error";
-    return null;
-  }
-
-  let result = parseAndValidate(text, market.outcomeCount);
-
-  if (!result) {
-    // Malformed JSON — retry once with a fresh call, per instruction. Never guess past this.
-    for (let attempt = 0; attempt < MALFORMED_JSON_RETRIES && !result; attempt++) {
-      await throttleForRateLimit(ESTIMATED_TOKENS_PER_FORECAST);
-      text = await callLLM(SYSTEM_PROMPT, userPrompt, { temperature: TEMPERATURE });
-      const tokensUsed2 = getLastTokensUsed();
-      if (tokensUsed2 !== null) recordTokenUsage(tokensUsed2);
-      if (!text) {
-        lastOutcomeStatus = getLastLLMCallStatus() ?? "error";
-        return null;
+  if (shouldRunSearchAugmented(cheapResult, market)) {
+    // Same never-throws guarantee as the disabled-path above — a Tavily
+    // failure here just means stage 2 has nothing to add, so we keep the
+    // already-valid stage-1 result rather than spending a second LLM call
+    // on a re-forecast with no new evidence (that would just waste tokens
+    // for a near-identical answer — the whole point of this feature is
+    // NOT spending tokens where they wouldn't change anything).
+    const { searchContext, sourcesUsed } = await buildSearchContext(market);
+    if (sourcesUsed.length > 0) {
+      const augmentedPrompt = buildUserPrompt(market, structured, searchContext);
+      const augmentedResult = await callAndParse(augmentedPrompt, market.outcomeCount);
+      if (augmentedResult) {
+        augmentedResult.sourcesUsed = sourcesUsed;
+        cache.set(market.address, { inputHash, result: augmentedResult, cachedAtMs: Date.now() });
+        return augmentedResult;
       }
-      result = parseAndValidate(text, market.outcomeCount);
-    }
-    if (!result) {
-      lastOutcomeStatus = "parse_failed";
-      return null;
+      // Stage 2's LLM call itself failed even though search succeeded — fall through to keep stage 1's result, same principle.
     }
   }
 
-  result.sourcesUsed = sourcesUsed;
-  cache.set(market.address, { inputHash, result, cachedAtMs: Date.now() });
-  lastOutcomeStatus = "ok";
-  return result;
+  cache.set(market.address, { inputHash, result: cheapResult, cachedAtMs: Date.now() });
+  return cheapResult;
 }

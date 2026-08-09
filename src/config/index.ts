@@ -119,6 +119,17 @@ export const forecastBudget = {
   dailyTokenBudget: Number(process.env.LLM_DAILY_TOKEN_BUDGET ?? 80_000),
   /** Re-forecast a market only after this many minutes, even if inputs are unchanged — not every loop pass. */
   forecastStalenessMinutes: Number(process.env.FORECAST_STALENESS_MINUTES ?? 30),
+
+  // --- Conditional search: a cheap no-search forecast runs first; a
+  // second, search-augmented call only fires when it could plausibly
+  // change a trade decision — see forecast.ts's shouldRunSearchAugmented().
+  // Defaults to ON (true) so a fresh checkout is already token-conserving;
+  // set false to fall back to the old always-search-if-configured behavior. ---
+  conditionalSearchEnabled: boolEnv("CONDITIONAL_SEARCH_ENABLED", true),
+  /** Below this confidence, the no-search forecast is treated as too uncertain to trust on its own. */
+  forecastSearchConfThreshold: Number(process.env.FORECAST_SEARCH_CONF_THRESHOLD ?? 0.5),
+  /** Minimum |no-search forecast probability - market price| for a search-augmented re-forecast to be worth its tokens — reuses risk.edgeThreshold by default, since that's the same bar a trade would need to clear anyway. */
+  forecastSearchMinEdge: Number(process.env.FORECAST_SEARCH_MIN_EDGE ?? risk.edgeThreshold),
 };
 
 // --- Phase 5: the persistent loop's cadence + retry behavior. ---
