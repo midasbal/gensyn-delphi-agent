@@ -52,8 +52,10 @@ export const risk = {
   kellyFraction: Number(process.env.KELLY_FRACTION ?? 0.25),
   /** Max TST committed to a single market. */
   maxPositionTokens: Number(process.env.MAX_POSITION_TOKENS ?? 10),
-  /** Max total TST committed across all open positions. */
-  maxTotalExposureTokens: Number(process.env.MAX_TOTAL_EXPOSURE_TOKENS ?? 100),
+  /** Max fraction of live account value (bankroll plus current total cost basis) committed across all open positions at once. Replaces the old flat MAX_TOTAL_EXPOSURE_TOKENS, which never scaled with the account and could saturate permanently after one bet. */
+  maxTotalExposureFraction: Number(process.env.MAX_TOTAL_EXPOSURE_FRACTION ?? 0.65),
+  /** Max fraction of live account value committed to a single market's entry. Bounds the first (and, per the over-re-entry guard, only) buy into a market. */
+  maxPerMarketExposureFraction: Number(process.env.MAX_PER_MARKET_EXPOSURE_FRACTION ?? 0.1),
   /** Gate (a): minimum combined-signal confidence to consider trading at all. */
   minConfidence: Number(process.env.MIN_CONFIDENCE ?? 0.5),
   /** Gate (b): oracle-ambiguity score (0-1, heuristic) above which a candidate is skipped outright. */

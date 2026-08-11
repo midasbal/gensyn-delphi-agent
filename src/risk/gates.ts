@@ -108,27 +108,59 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
     extremeSizeShrink = riskConfig.extremeSizeMultiplier;
   }
 
-  // (e) Sizing — conservative fractional Kelly, scaled by confidence and shrink factors, capped both per-market and total.
+  // (e) Sizing: conservative fractional Kelly, scaled by confidence and shrink
+  // factors, capped by a per-market absolute, a per-market fraction of live
+  // account value, and a total fraction of live account value.
+  //
+  // Account value (accountValueTokens) is bankroll plus current total cost
+  // basis, both already passed in ctx, in the same TST unit as
+  // currentTotalExposureTokens. Both exposure caps scale with this instead
+  // of being a flat absolute, so a growing (or shrinking) account moves the
+  // caps with it, and a single bet can never permanently saturate the total
+  // cap the way a flat MAX_TOTAL_EXPOSURE_TOKENS could.
   const ambiguityShrink = 1 - ambiguity.score;
   const kellyFraction = conservativeKellyFraction(edge, price, riskConfig.kellyFraction, confidence, [ambiguityShrink, extremeSizeShrink]);
-  let desiredTokens = kellyFraction * ctx.bankroll;
-  desiredTokens = Math.min(desiredTokens, riskConfig.maxPositionTokens);
-  const remainingExposureBudget = Math.max(0, riskConfig.maxTotalExposureTokens - ctx.currentTotalExposureTokens);
-  desiredTokens = Math.min(desiredTokens, remainingExposureBudget);
+  const kellyDesiredTokens = kellyFraction * ctx.bankroll;
+
+  const accountValueTokens = ctx.bankroll + ctx.currentTotalExposureTokens;
+  const maxTotalExposureTokens = riskConfig.maxTotalExposureFraction * accountValueTokens;
+  const remainingExposureBudget = Math.max(0, maxTotalExposureTokens - ctx.currentTotalExposureTokens);
+  const perMarketCapTokens = riskConfig.maxPerMarketExposureFraction * accountValueTokens;
+
+  // Track which cap actually binds, for the skip reason below (requirement:
+  // report which bound caused the skip, not just the final number).
+  const sizeCandidates: Array<{ label: string; value: number }> = [
+    { label: "kelly", value: kellyDesiredTokens },
+    { label: "maxPositionTokens", value: riskConfig.maxPositionTokens },
+    { label: "remainingExposureBudget", value: remainingExposureBudget },
+    { label: "perMarketCapTokens", value: perMarketCapTokens },
+  ];
+  let desiredTokens = sizeCandidates[0]!.value;
+  let bindingConstraint = sizeCandidates[0]!.label;
+  for (const candidate of sizeCandidates.slice(1)) {
+    if (candidate.value < desiredTokens) {
+      desiredTokens = candidate.value;
+      bindingConstraint = candidate.label;
+    }
+  }
 
   // F1 (thinMarketFillsEnabled): the dust-threshold floor is a SOFT policy
-  // minimum this rule is explicitly allowed to fill below — enforcement
+  // minimum this rule is explicitly allowed to fill below, enforcement
   // moves to gate f's hardMinShares check instead. Phase 3 default
   // (disabled): unchanged hard skip here.
   if (!riskConfig.thinMarketFillsEnabled && desiredTokens < riskConfig.dustThresholdTokens) {
     return skipResult(
       market,
       "sizing",
-      `sized position ${desiredTokens.toFixed(4)} TST is below dust threshold ${riskConfig.dustThresholdTokens} after Kelly/caps (kellyFraction=${kellyFraction.toFixed(4)}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)})`
+      `sized position ${desiredTokens.toFixed(4)} TST is below dust threshold ${riskConfig.dustThresholdTokens} after Kelly/caps (kellyFraction=${kellyFraction.toFixed(4)}, boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketCapTokens=${perMarketCapTokens.toFixed(2)})`
     );
   }
   if (desiredTokens <= 0) {
-    return skipResult(market, "sizing", `sized position is ${desiredTokens.toFixed(4)} TST — nothing to size (remainingExposureBudget=${remainingExposureBudget.toFixed(2)})`);
+    return skipResult(
+      market,
+      "sizing",
+      `sized position is ${desiredTokens.toFixed(4)} TST, nothing to size (boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketCapTokens=${perMarketCapTokens.toFixed(2)})`
+    );
   }
 
   const desiredShares = desiredTokens / price;
