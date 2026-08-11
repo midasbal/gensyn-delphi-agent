@@ -74,6 +74,24 @@ export interface MarketDecisionLog {
   reason?: string;
   edge?: number;
   layers: LayerLog;
+  /**
+   * Edge instrumentation (additive, does not influence any decision): the
+   * combined-signal probability and market price for the specific outcome
+   * this record's edge was computed against, the forecast confidence at
+   * decision time (post Layer D bump, if any), whether the portfolio
+   * already held this market when this decision was made, and a plain
+   * buy/skip/hold/exit label for the action actually taken. `gate` above
+   * already carries which risk-gate step caused a skip (edgeThreshold,
+   * matchQuality covers the confidence check, oracleAmbiguity, extremes,
+   * depthSlippage, sizing, plus this loop's own alreadyHeld). This exists
+   * to calibrate the edge threshold from real data, not to change what
+   * that threshold does.
+   */
+  ourProbability?: number;
+  marketPrice?: number;
+  confidence?: number;
+  positionHeld: boolean;
+  action: "buy" | "skip" | "hold" | "exit";
 }
 
 export interface CoherencePairLog {
@@ -194,6 +212,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
 
     const withinMarket = withinMarketByAddress.get(market.address);
     const moveCheck = moveByAddress.get(market.address);
+    const positionHeld = [...portfolio.positions.values()].some((p) => p.marketAddress === market.address);
 
     const candidate = selectCandidate(market, combined);
     if (!candidate) {
@@ -201,6 +220,38 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       decisions.push({
         market,
         outcome: "no-candidate",
+        positionHeld,
+        action: "skip",
+        layers: {
+          layerA: layers.aEnabled ? moveCheck : undefined,
+          layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
+          layerC: withinMarket ? { withinMarketFlagged: withinMarket.flaggedForReview, drift: withinMarket.drift } : undefined,
+        },
+      });
+      continue;
+    }
+
+    // --- Over-re-entry guard: one open position per market for the life of
+    // that market. Matches on marketAddress only (not marketAddress +
+    // outcomeIdx), so holding ANY outcome in this market blocks a buy into
+    // ANY outcome of the same market, no adds and no re-entries. Checked
+    // right after candidate selection and before Layer D / the risk gate,
+    // so an already-held market never spends a quote call it can't act on.
+    // Exits, reductions, and settlement redemptions are a different path
+    // entirely (execution/settlementSweep.ts) and are untouched by this. ---
+    if (positionHeld) {
+      recordActedReference(market.address, consensus?.outcomes[0]?.probability ?? null, market.spotPrices?.[0] ?? NaN);
+      decisions.push({
+        market,
+        outcome: "skipped",
+        gate: "alreadyHeld",
+        reason: `already holding an open position in this market, no adds, no re-entries`,
+        edge: candidate.edge,
+        ourProbability: candidate.probability,
+        marketPrice: candidate.price,
+        confidence: candidate.confidence,
+        positionHeld,
+        action: "hold",
         layers: {
           layerA: layers.aEnabled ? moveCheck : undefined,
           layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
@@ -237,7 +288,19 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     const gateResult = await runRiskGate(candidate, { structured, bankroll: portfolio.bankroll, currentTotalExposureTokens });
 
     if (gateResult.action === "skip") {
-      decisions.push({ market, outcome: "skipped", gate: gateResult.skip.gate, reason: gateResult.skip.reason, edge: candidate.edge, layers: layerLog });
+      decisions.push({
+        market,
+        outcome: "skipped",
+        gate: gateResult.skip.gate,
+        reason: gateResult.skip.reason,
+        edge: candidate.edge,
+        ourProbability: candidate.probability,
+        marketPrice: candidate.price,
+        confidence: candidate.confidence,
+        positionHeld,
+        action: "skip",
+        layers: layerLog,
+      });
       continue;
     }
 
@@ -248,13 +311,28 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
         gate: "sizing",
         reason: `insufficient paper bankroll (${portfolio.bankroll.toFixed(4)} TST < ${gateResult.trade.finalTokensIn.toFixed(4)} TST needed)`,
         edge: candidate.edge,
+        ourProbability: candidate.probability,
+        marketPrice: candidate.price,
+        confidence: candidate.confidence,
+        positionHeld,
+        action: "skip",
         layers: layerLog,
       });
       continue;
     }
 
     await executeTrade(gateResult.trade, portfolio);
-    decisions.push({ market, outcome: "traded", edge: candidate.edge, layers: layerLog });
+    decisions.push({
+      market,
+      outcome: "traded",
+      edge: candidate.edge,
+      ourProbability: candidate.probability,
+      marketPrice: candidate.price,
+      confidence: candidate.confidence,
+      positionHeld,
+      action: "buy",
+      layers: layerLog,
+    });
   }
 
   // --- Layer C, across-market: run once over the whole batch after structuring ---

@@ -5,6 +5,14 @@
  * the full NormalizedMarket blob — enough to reconstruct WHY every decision
  * was made without bloating a long-running VPS process's disk usage with
  * redundant on-chain metadata already available from the market address.
+ *
+ * ourProbability/marketPrice/confidence/positionHeld/action are edge
+ * instrumentation: additive fields for calibrating the edge threshold from
+ * real data, not inputs to any decision. `gate` (when the outcome is
+ * "skipped") already names which risk-gate step caused the skip
+ * (edgeThreshold, matchQuality covers the confidence check,
+ * oracleAmbiguity, extremes, depthSlippage, sizing, or this loop's own
+ * alreadyHeld).
  */
 import { appendJsonLine } from "./writer.js";
 import type { MarketDecisionLog } from "../loop/paperLoop.js";
@@ -20,6 +28,11 @@ export interface DecisionLogEntry {
   gate?: string;
   reason?: string;
   edge?: number;
+  ourProbability?: number;
+  marketPrice?: number;
+  confidence?: number;
+  positionHeld: boolean;
+  action: "buy" | "skip" | "hold" | "exit";
   layers: MarketDecisionLog["layers"];
 }
 
@@ -35,6 +48,11 @@ export async function logDecision(decision: MarketDecisionLog): Promise<void> {
     gate: decision.gate,
     reason: decision.reason,
     edge: decision.edge,
+    ourProbability: decision.ourProbability,
+    marketPrice: decision.marketPrice,
+    confidence: decision.confidence,
+    positionHeld: decision.positionHeld,
+    action: decision.action,
     layers: decision.layers,
   };
   await appendJsonLine("decisions", entry);
