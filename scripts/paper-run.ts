@@ -112,7 +112,15 @@ if (isLive()) {
   };
 
   const currentExposure = [...portfolio.positions.values()].reduce((sum, p) => sum + p.costBasis, 0);
-  const gateResult = await runRiskGate(syntheticCandidate, { structured: syntheticStructured, bankroll: portfolio.bankroll, currentTotalExposureTokens: currentExposure });
+  const currentMarketExposure = [...portfolio.positions.values()]
+    .filter((p) => p.marketAddress === demoMarket.address)
+    .reduce((sum, p) => sum + p.costBasis, 0);
+  const gateResult = await runRiskGate(syntheticCandidate, {
+    structured: syntheticStructured,
+    bankroll: portfolio.bankroll,
+    currentTotalExposureTokens: currentExposure,
+    currentMarketExposureTokens: currentMarketExposure,
+  });
 
   if (gateResult.action === "trade") {
     const record = await executeTrade(gateResult.trade, portfolio);

@@ -32,7 +32,7 @@ export interface DecisionLogEntry {
   marketPrice?: number;
   confidence?: number;
   positionHeld: boolean;
-  action: "buy" | "skip" | "hold" | "exit";
+  action: "buy" | "add" | "skip" | "hold" | "exit";
   layers: MarketDecisionLog["layers"];
 }
 

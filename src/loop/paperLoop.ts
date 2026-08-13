@@ -45,7 +45,7 @@ import { combineSignals } from "../signals/combine.js";
 import { selectCandidate, runRiskGate } from "../risk/gates.js";
 import { executeTrade } from "../execution/paperTrade.js";
 import { PaperPortfolio } from "../portfolio/paperPortfolio.js";
-import { activity, layers } from "../config/index.js";
+import { activity, layers, risk as riskConfig } from "../config/index.js";
 import { logDecision } from "../logging/index.js";
 import { writeHeartbeat } from "./heartbeat.js";
 import type { NormalizedMarket } from "../markets/types.js";
@@ -91,7 +91,7 @@ export interface MarketDecisionLog {
   marketPrice?: number;
   confidence?: number;
   positionHeld: boolean;
-  action: "buy" | "skip" | "hold" | "exit";
+  action: "buy" | "add" | "skip" | "hold" | "exit";
 }
 
 export interface CoherencePairLog {
@@ -213,6 +213,10 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     const withinMarket = withinMarketByAddress.get(market.address);
     const moveCheck = moveByAddress.get(market.address);
     const positionHeld = [...portfolio.positions.values()].some((p) => p.marketAddress === market.address);
+    const currentTotalExposureTokens = [...portfolio.positions.values()].reduce((sum, p) => sum + p.costBasis, 0);
+    const currentMarketExposureTokens = [...portfolio.positions.values()]
+      .filter((p) => p.marketAddress === market.address)
+      .reduce((sum, p) => sum + p.costBasis, 0);
 
     const candidate = selectCandidate(market, combined);
     if (!candidate) {
@@ -231,34 +235,47 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       continue;
     }
 
-    // --- Over-re-entry guard: one open position per market for the life of
-    // that market. Matches on marketAddress only (not marketAddress +
-    // outcomeIdx), so holding ANY outcome in this market blocks a buy into
-    // ANY outcome of the same market, no adds and no re-entries. Checked
-    // right after candidate selection and before Layer D / the risk gate,
-    // so an already-held market never spends a quote call it can't act on.
+    // --- Over-re-entry guard: bounds ADDS to a held market by remaining
+    // per-market budget instead of blocking every add outright. Matches on
+    // marketAddress only (not marketAddress + outcomeIdx), so exposure in
+    // ANY outcome of this market counts against the same per-market cap.
+    // A fresh entry (not held) always proceeds unchanged. A held market
+    // proceeds to Layer D / the risk gate ONLY if there is remaining
+    // per-market budget, risk/gates.ts's sizing step (e) then bounds the
+    // actual add size by that same remaining budget
+    // (ctx.currentMarketExposureTokens), so total per-market exposure can
+    // never exceed the per-market cap. The unbounded-re-entry problem this
+    // guard originally solved (walking price with repeated re-entries)
+    // stays solved, because the cumulative per-market cap bounds it. If
+    // there is no remaining budget at all, skip here without spending
+    // Layer D's herding lookup or the risk gate's ambiguity scoring on a
+    // market that could not size anything anyway.
     // Exits, reductions, and settlement redemptions are a different path
     // entirely (execution/settlementSweep.ts) and are untouched by this. ---
     if (positionHeld) {
-      recordActedReference(market.address, consensus?.outcomes[0]?.probability ?? null, market.spotPrices?.[0] ?? NaN);
-      decisions.push({
-        market,
-        outcome: "skipped",
-        gate: "alreadyHeld",
-        reason: `already holding an open position in this market, no adds, no re-entries`,
-        edge: candidate.edge,
-        ourProbability: candidate.probability,
-        marketPrice: candidate.price,
-        confidence: candidate.confidence,
-        positionHeld,
-        action: "hold",
-        layers: {
-          layerA: layers.aEnabled ? moveCheck : undefined,
-          layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
-          layerC: withinMarket ? { withinMarketFlagged: withinMarket.flaggedForReview, drift: withinMarket.drift } : undefined,
-        },
-      });
-      continue;
+      const accountValueTokens = portfolio.bankroll + currentTotalExposureTokens;
+      const perMarketRemaining = Math.max(0, riskConfig.maxPerMarketExposureFraction * accountValueTokens - currentMarketExposureTokens);
+      if (perMarketRemaining <= 0) {
+        recordActedReference(market.address, consensus?.outcomes[0]?.probability ?? null, market.spotPrices?.[0] ?? NaN);
+        decisions.push({
+          market,
+          outcome: "skipped",
+          gate: "atPerMarketCap",
+          reason: `already holding ${currentMarketExposureTokens.toFixed(4)} TST in this market, at or above the per-market cap, perMarketRemaining=${perMarketRemaining.toFixed(4)}, no further adds`,
+          edge: candidate.edge,
+          ourProbability: candidate.probability,
+          marketPrice: candidate.price,
+          confidence: candidate.confidence,
+          positionHeld,
+          action: "hold",
+          layers: {
+            layerA: layers.aEnabled ? moveCheck : undefined,
+            layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
+            layerC: withinMarket ? { withinMarketFlagged: withinMarket.flaggedForReview, drift: withinMarket.drift } : undefined,
+          },
+        });
+        continue;
+      }
     }
 
     // --- Layer D: corroborating fade only, applied AFTER candidate selection ---
@@ -283,9 +300,12 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
 
     recordActedReference(market.address, consensus?.outcomes[0]?.probability ?? null, market.spotPrices?.[0] ?? NaN);
 
-    const currentTotalExposureTokens = [...portfolio.positions.values()].reduce((sum, p) => sum + p.costBasis, 0);
+    // currentTotalExposureTokens/currentMarketExposureTokens were computed
+    // above (before the over-re-entry guard) and are still accurate here:
+    // nothing between there and here mutates portfolio.positions, Layer D
+    // only adjusts candidate.confidence.
     const structured = structuredByAddress.get(market.address)!;
-    const gateResult = await runRiskGate(candidate, { structured, bankroll: portfolio.bankroll, currentTotalExposureTokens });
+    const gateResult = await runRiskGate(candidate, { structured, bankroll: portfolio.bankroll, currentTotalExposureTokens, currentMarketExposureTokens });
 
     if (gateResult.action === "skip") {
       decisions.push({
@@ -330,7 +350,10 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       marketPrice: candidate.price,
       confidence: candidate.confidence,
       positionHeld,
-      action: "buy",
+      // positionHeld here means we sized into a market we already held: an
+      // add, bounded by the per-market remaining budget in risk/gates.ts's
+      // sizing step. Not held means this is a fresh entry.
+      action: positionHeld ? "add" : "buy",
       layers: layerLog,
     });
   }

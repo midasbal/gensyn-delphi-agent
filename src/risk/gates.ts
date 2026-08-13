@@ -55,6 +55,8 @@ export interface GateContext {
   structured: StructuredResolution;
   bankroll: number;
   currentTotalExposureTokens: number;
+  /** Cost basis already committed to THIS market (any outcomeIdx), 0 if not held. Bounds an add to a held market by what is left of the per-market cap, see gate (e). */
+  currentMarketExposureTokens: number;
 }
 
 export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): Promise<GateDecision> {
@@ -109,8 +111,9 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
   }
 
   // (e) Sizing: conservative fractional Kelly, scaled by confidence and shrink
-  // factors, capped by a per-market absolute, a per-market fraction of live
-  // account value, and a total fraction of live account value.
+  // factors, capped by a per-market absolute, the REMAINING per-market
+  // fraction of live account value, and a total fraction of live account
+  // value.
   //
   // Account value (accountValueTokens) is bankroll plus current total cost
   // basis, both already passed in ctx, in the same TST unit as
@@ -118,6 +121,16 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
   // of being a flat absolute, so a growing (or shrinking) account moves the
   // caps with it, and a single bet can never permanently saturate the total
   // cap the way a flat MAX_TOTAL_EXPOSURE_TOKENS could.
+  //
+  // perMarketRemaining subtracts ctx.currentMarketExposureTokens (0 if this
+  // market is not currently held) from the per-market cap, so an add to a
+  // held market is bounded by what is left of that market's own cap, not
+  // by the flat per-market cap itself. A fresh entry (currentMarketExposureTokens
+  // is 0) sees the full per-market cap, same as before. This is what lets
+  // loop/paperLoop.ts's over-re-entry guard allow an add up to the cap
+  // instead of blocking every add outright: cumulative per-market exposure
+  // still can never exceed the cap, so unbounded re-entry stays impossible.
+  const isAdd = ctx.currentMarketExposureTokens > 0;
   const ambiguityShrink = 1 - ambiguity.score;
   const kellyFraction = conservativeKellyFraction(edge, price, riskConfig.kellyFraction, confidence, [ambiguityShrink, extremeSizeShrink]);
   const kellyDesiredTokens = kellyFraction * ctx.bankroll;
@@ -125,7 +138,7 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
   const accountValueTokens = ctx.bankroll + ctx.currentTotalExposureTokens;
   const maxTotalExposureTokens = riskConfig.maxTotalExposureFraction * accountValueTokens;
   const remainingExposureBudget = Math.max(0, maxTotalExposureTokens - ctx.currentTotalExposureTokens);
-  const perMarketCapTokens = riskConfig.maxPerMarketExposureFraction * accountValueTokens;
+  const perMarketRemaining = Math.max(0, riskConfig.maxPerMarketExposureFraction * accountValueTokens - ctx.currentMarketExposureTokens);
 
   // Track which cap actually binds, for the skip reason below (requirement:
   // report which bound caused the skip, not just the final number).
@@ -133,7 +146,7 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
     { label: "kelly", value: kellyDesiredTokens },
     { label: "maxPositionTokens", value: riskConfig.maxPositionTokens },
     { label: "remainingExposureBudget", value: remainingExposureBudget },
-    { label: "perMarketCapTokens", value: perMarketCapTokens },
+    { label: "perMarketRemaining", value: perMarketRemaining },
   ];
   let desiredTokens = sizeCandidates[0]!.value;
   let bindingConstraint = sizeCandidates[0]!.label;
@@ -152,14 +165,14 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
     return skipResult(
       market,
       "sizing",
-      `sized position ${desiredTokens.toFixed(4)} TST is below dust threshold ${riskConfig.dustThresholdTokens} after Kelly/caps (kellyFraction=${kellyFraction.toFixed(4)}, boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketCapTokens=${perMarketCapTokens.toFixed(2)})`
+      `sized ${isAdd ? "add" : "entry"} ${desiredTokens.toFixed(4)} TST is below dust threshold ${riskConfig.dustThresholdTokens} after Kelly/caps (kellyFraction=${kellyFraction.toFixed(4)}, boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketRemaining=${perMarketRemaining.toFixed(2)}, currentMarketExposureTokens=${ctx.currentMarketExposureTokens.toFixed(2)})`
     );
   }
   if (desiredTokens <= 0) {
     return skipResult(
       market,
       "sizing",
-      `sized position is ${desiredTokens.toFixed(4)} TST, nothing to size (boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketCapTokens=${perMarketCapTokens.toFixed(2)})`
+      `sized ${isAdd ? "add" : "entry"} is ${desiredTokens.toFixed(4)} TST, nothing to size (boundBy=${bindingConstraint}, remainingExposureBudget=${remainingExposureBudget.toFixed(2)}, perMarketRemaining=${perMarketRemaining.toFixed(2)}, currentMarketExposureTokens=${ctx.currentMarketExposureTokens.toFixed(2)})`
     );
   }
 
