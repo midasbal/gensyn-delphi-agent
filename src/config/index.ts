@@ -58,6 +58,30 @@ export const risk = {
   maxPerMarketExposureFraction: Number(process.env.MAX_PER_MARKET_EXPOSURE_FRACTION ?? 0.1),
   /** Gate (a): minimum combined-signal confidence to consider trading at all. */
   minConfidence: Number(process.env.MIN_CONFIDENCE ?? 0.5),
+  /**
+   * Trade-scored calibration (reports/calibration-report.json) found the
+   * model's forecasts underperformed the market prices they traded
+   * against, worst on the largest divergences: capital-weighted model
+   * Brier 0.274 vs market 0.210 overall, and 0/12 win rate on trades with
+   * |edge| > 0.25. Two controls address this:
+   *
+   * marketShrinkLambda: how far our probability moves toward the quoted
+   * price before edge/sizing, 0 to 1. 0 = trust the model fully (the old
+   * behavior). 1 = trust the market fully (edge always collapses to 0,
+   * never trades). 0.5 (the default) moves our estimate halfway to the
+   * market. Applied once, before edge is computed, so both the edge-
+   * threshold gate and Kelly sizing see the shrunk value, every position
+   * shrinks proportionally along with the edge that sized it. See
+   * risk/gates.ts's shrinkTowardMarket().
+   */
+  marketShrinkLambda: Number(process.env.MARKET_SHRINK_LAMBDA ?? 0.5),
+  /**
+   * Hard cutoff on the RAW divergence (ourProbability - price, BEFORE
+   * shrinking): every trade past this in the calibration data lost, so
+   * this refuses to act on it at all rather than merely shrinking it.
+   * Checked before marketShrinkLambda is applied, see risk/gates.ts.
+   */
+  maxRawEdge: Number(process.env.MAX_RAW_EDGE ?? 0.25),
   /** Gate (b): oracle-ambiguity score (0-1, heuristic) above which a candidate is skipped outright. */
   oracleAmbiguitySkipThreshold: Number(process.env.ORACLE_AMBIGUITY_SKIP_THRESHOLD ?? 0.75),
   /** Gate (d): price within this distance of 0 or 1 is an "extreme" — edge requirement widens, size shrinks. */

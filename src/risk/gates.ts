@@ -14,8 +14,31 @@ import { quoteWithSlippageClip } from "../execution/quote.js";
 import { resolveThinMarketFill } from "../execution/thinMarketFill.js";
 import type { GateDecision, TradeCandidate } from "./types.js";
 
-function skipResult(market: NormalizedMarket, gate: "candidate" | "matchQuality" | "oracleAmbiguity" | "edgeThreshold" | "extremes" | "sizing" | "depthSlippage", reason: string): GateDecision {
+function skipResult(
+  market: NormalizedMarket,
+  gate: "candidate" | "rawEdgeTooLarge" | "matchQuality" | "oracleAmbiguity" | "edgeThreshold" | "extremes" | "sizing" | "depthSlippage",
+  reason: string
+): GateDecision {
   return { action: "skip", skip: { gate, reason }, market };
+}
+
+/**
+ * Shrinks ourProbability toward the market price by riskConfig.marketShrinkLambda,
+ * before edge is computed from it. lambda=0 keeps the raw model probability
+ * (old behavior, edge = ourProbability - price unchanged). lambda=1
+ * collapses fully to the market price (adjustedEdge is always 0, never
+ * trades). adjustedEdge = adjustedProbability - price, which works out to
+ * exactly (1 - lambda) * (ourProbability - price): the raw edge, scaled
+ * down by the same factor the probability was pulled toward the market.
+ *
+ * Exported (not just used internally by runRiskGate below) so
+ * loop/paperLoop.ts can compute the same adjusted values for the decision
+ * log on every decision, including ones that skip before reaching this
+ * function's own internal use of it, without duplicating the formula.
+ */
+export function shrinkTowardMarket(ourProbability: number, price: number): { adjustedProbability: number; adjustedEdge: number } {
+  const adjustedProbability = ourProbability + riskConfig.marketShrinkLambda * (price - ourProbability);
+  return { adjustedProbability, adjustedEdge: adjustedProbability - price };
 }
 
 /**
@@ -60,7 +83,27 @@ export interface GateContext {
 }
 
 export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): Promise<GateDecision> {
-  const { market, outcomeIdx, price, probability, confidence, edge, consensusMatchQuality, hasForecast } = candidate;
+  const { market, outcomeIdx, price, confidence, consensusMatchQuality, hasForecast } = candidate;
+  const rawProbability = candidate.probability;
+  const rawEdge = candidate.edge;
+
+  // (0) Hard cutoff on the RAW divergence, before any shrinkage below.
+  // Trade-scored calibration found every trade past this threshold lost
+  // (capital-weighted model Brier 0.21 vs market 0.022 on that subset,
+  // 0/12 win rate): this is a belt to the shrinkage suspenders below,
+  // refusing to act on divergences that were pure anti-signal rather than
+  // merely shrinking them.
+  if (Math.abs(rawEdge) > riskConfig.maxRawEdge) {
+    return skipResult(market, "rawEdgeTooLarge", `raw |edge| ${Math.abs(rawEdge).toFixed(4)} exceeds MAX_RAW_EDGE ${riskConfig.maxRawEdge} before shrinkage`);
+  }
+
+  // adjustedProbability/adjustedEdge REPLACE rawProbability/rawEdge for
+  // every gate and the sizing math from here down, per the calibration
+  // finding that a large divergence from the market price was anti-signal,
+  // not opportunity. `probability` and `edge` below are these adjusted
+  // values, not the raw candidate fields: gate (c)'s edge-threshold check,
+  // gate (d)'s extremes check, and gate (e)'s Kelly sizing all use them.
+  const { adjustedProbability: probability, adjustedEdge: edge } = shrinkTowardMarket(rawProbability, price);
 
   // (a) Confidence + matchQuality gate — matchQuality is a HARD gate: a
   // consensus match that isn't "high" quality cannot alone justify a trade;
@@ -203,6 +246,11 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
       action: "trade",
       trade: {
         ...candidate,
+        // Explicit overrides: without these, the ...candidate spread above
+        // would put the RAW probability/edge into the trade record instead
+        // of the shrunk values that actually determined this size.
+        probability,
+        edge,
         desiredShares,
         kellyFraction,
         oracleAmbiguityScore: ambiguity.score,
@@ -227,6 +275,11 @@ export async function runRiskGate(candidate: TradeCandidate, ctx: GateContext): 
     action: "trade",
     trade: {
       ...candidate,
+      // Explicit overrides: without these, the ...candidate spread above
+      // would put the RAW probability/edge into the trade record instead
+      // of the shrunk values that actually determined this size.
+      probability,
+      edge,
       desiredShares,
       kellyFraction,
       oracleAmbiguityScore: ambiguity.score,

@@ -1,7 +1,7 @@
 import type { NormalizedMarket } from "../markets/types.js";
 import type { MatchQuality } from "../signals/consensus/types.js";
 
-export type GateName = "candidate" | "matchQuality" | "oracleAmbiguity" | "edgeThreshold" | "extremes" | "sizing" | "depthSlippage";
+export type GateName = "candidate" | "rawEdgeTooLarge" | "matchQuality" | "oracleAmbiguity" | "edgeThreshold" | "extremes" | "sizing" | "depthSlippage";
 
 /** A market+outcome worth evaluating: the outcome with the largest POSITIVE edge on this market, if any. */
 export interface TradeCandidate {

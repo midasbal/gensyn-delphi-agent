@@ -42,7 +42,7 @@ import { structureResolution } from "../signals/forecasting/structureResolution.
 import { forecastProbability, getLastForecastTimeMs } from "../signals/forecasting/forecast.js";
 import { runForecastGovernor, type ForecastCandidate } from "../signals/forecastGovernor.js";
 import { combineSignals } from "../signals/combine.js";
-import { selectCandidate, runRiskGate } from "../risk/gates.js";
+import { selectCandidate, runRiskGate, shrinkTowardMarket } from "../risk/gates.js";
 import { executeTrade } from "../execution/paperTrade.js";
 import { PaperPortfolio } from "../portfolio/paperPortfolio.js";
 import { activity, layers, risk as riskConfig } from "../config/index.js";
@@ -92,6 +92,22 @@ export interface MarketDecisionLog {
   confidence?: number;
   positionHeld: boolean;
   action: "buy" | "add" | "skip" | "hold" | "exit";
+  /**
+   * Market-shrink calibration fix: `edge`/`ourProbability` above stay the
+   * RAW values (unchanged meaning, ourProbability - marketPrice), exactly
+   * as before this fix. adjustedProbability/adjustedEdge are the shrunk
+   * values risk/gates.ts's shrinkTowardMarket() actually used for the
+   * edge-threshold gate and Kelly sizing (or would have used, computed the
+   * same way here even for decisions that never reached the gate, so
+   * every decision with a candidate shows both). Compare them directly to
+   * see how much shrinkage moved a given decision, and to confirm over
+   * time that adjusted edges cluster near the market. `gate ===
+   * "rawEdgeTooLarge"` marks the new hard cutoff on the RAW divergence
+   * firing before shrinkage ever applies; any other skip gate firing here
+   * that would not have fired on the raw edge is shrinkage doing its job.
+   */
+  adjustedProbability?: number;
+  adjustedEdge?: number;
 }
 
 export interface CoherencePairLog {
@@ -257,6 +273,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       const perMarketRemaining = Math.max(0, riskConfig.maxPerMarketExposureFraction * accountValueTokens - currentMarketExposureTokens);
       if (perMarketRemaining <= 0) {
         recordActedReference(market.address, consensus?.outcomes[0]?.probability ?? null, market.spotPrices?.[0] ?? NaN);
+        const { adjustedProbability, adjustedEdge } = shrinkTowardMarket(candidate.probability, candidate.price);
         decisions.push({
           market,
           outcome: "skipped",
@@ -268,6 +285,8 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
           confidence: candidate.confidence,
           positionHeld,
           action: "hold",
+          adjustedProbability,
+          adjustedEdge,
           layers: {
             layerA: layers.aEnabled ? moveCheck : undefined,
             layerB: layers.bEnabled ? { isLongTail: longTailByAddress.get(market.address) ?? false, reason: "" } : undefined,
@@ -308,6 +327,7 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
     const gateResult = await runRiskGate(candidate, { structured, bankroll: portfolio.bankroll, currentTotalExposureTokens, currentMarketExposureTokens });
 
     if (gateResult.action === "skip") {
+      const { adjustedProbability, adjustedEdge } = shrinkTowardMarket(candidate.probability, candidate.price);
       decisions.push({
         market,
         outcome: "skipped",
@@ -319,6 +339,8 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
         confidence: candidate.confidence,
         positionHeld,
         action: "skip",
+        adjustedProbability,
+        adjustedEdge,
         layers: layerLog,
       });
       continue;
@@ -336,6 +358,11 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
         confidence: candidate.confidence,
         positionHeld,
         action: "skip",
+        // gateResult.trade already carries the adjusted (shrunk) values,
+        // risk/gates.ts's returned trade object is the authoritative source
+        // once the gate has actually run, not recomputed here.
+        adjustedProbability: gateResult.trade.probability,
+        adjustedEdge: gateResult.trade.edge,
         layers: layerLog,
       });
       continue;
@@ -354,6 +381,15 @@ export async function runPaperPass(portfolio: PaperPortfolio): Promise<PaperPass
       // add, bounded by the per-market remaining budget in risk/gates.ts's
       // sizing step. Not held means this is a fresh entry.
       action: positionHeld ? "add" : "buy",
+      // gateResult.trade.probability/edge are the SHRUNK values that
+      // actually determined this trade's size (see risk/gates.ts's
+      // shrinkTowardMarket and its two explicit override sites). This is
+      // also what lands in the TradeRecord/portfolio.trades ledger via
+      // execution/paperTrade.ts, so ourProbability/edge above (the raw
+      // values) and adjustedProbability/adjustedEdge below intentionally
+      // diverge from what portfolio.trades records for this same trade.
+      adjustedProbability: gateResult.trade.probability,
+      adjustedEdge: gateResult.trade.edge,
       layers: layerLog,
     });
   }
