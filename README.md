@@ -17,6 +17,14 @@ that matters is whether the agent's trades made money. This repo is that
 agent: its market-reading pipeline, its risk controls, and the
 infrastructure to run it unattended.
 
+> **A note for reviewers.** The competition is over. The agent ran live,
+> traded as engineered, and lost money. Everything from here through
+> ["Design principles"](#design-principles) describes the *intent* going
+> in; the [Retrospective](#retrospective) below is the *measured outcome*,
+> written after the fact with no softening. Reading the honest gap between
+> the two is the point of this repo: start there if you only read one
+> section.
+
 ## The problem, and the reasoning behind the approach
 
 Strip away the blockchain mechanics and the competition is a forecasting
@@ -79,7 +87,10 @@ At a high level, each pass through the pipeline:
 On top of that core pipeline sit six additional, individually toggleable
 signal/risk layers. Each is described here at the level of *what it's for*
 — the specific thresholds and tuning live in a private strategy document,
-deliberately kept out of this public README while the competition is live:
+deliberately kept out of this public README while the competition is live.
+In practice, live behavior was dominated by the core pipeline and the
+forecasting path; several of these layers fired rarely or not at all over
+the competition window, see the [Retrospective](#retrospective):
 
 - **Latency** — notices when an external reference has moved since this
   agent last acted on a market, so it can prioritize re-checking markets
@@ -130,20 +141,89 @@ exactly how each is enforced (both gitignored, local reference — see
 ["Local docs"](#local-docs-gitignored--not-tracked-for-your-own-reference)
 below).
 
-## Retrospective (to be completed after the competition)
+## Retrospective
 
-*This section is intentionally blank until the competition concludes — it
-will be filled in honestly, whatever the outcome.*
+*Written after the competition concluded, from measured results, not
+memory of intent.*
 
 ### What we set out to achieve
 
+Build an agent whose edge came primarily from cross-referencing Delphi's
+prices against sharper, more liquid external markets (Polymarket, sportsbook
+odds, live asset prices), falling back to a disciplined LLM forecast only
+where no such reference existed, on the theory, laid out above, that an
+LLM's raw probability estimate is not, by itself, a trustworthy foundation
+for sizing real capital. The risk pipeline, PAPER/LIVE gating, persistence,
+and watchdog were built to let that strategy run unattended and recover
+from failure without losing state or over-trading while unsupervised.
+
 ### What actually happened
+
+The agent deployed live on testnet and traded roughly a dozen markets over
+the competition window. It finished deep in the field, with negative
+realized P&L. A trade-scored calibration analysis after the fact
+(`scripts/calibration-report.ts`, `reports/calibration-report.json`) showed
+why: capital-weighted, the model's forecast Brier score was 0.274 against
+the market's own 0.210 on the same trades: the agent's estimates were
+measurably worse than the prices it was trading against, not better. The
+gap was worst exactly where the strategy should have been strongest: on the
+12 trades where the model's claimed edge over the market price exceeded
+0.25, the win rate was 0 of 12, with a model Brier of 0.21 against the
+market's 0.022 on that same subset. The single largest loss was not a
+long-tail forecast gone wrong; it was a moderate-edge position, sized up
+and added to more than once on repeated confidence, that resolved against
+the forecast.
 
 ### What went to plan
 
+The engineering held up under real conditions. The PAPER/LIVE gate never
+leaked a live transaction during testing. State persistence and the
+watchdog both did their job. Restarts (including a real `kill -9` and cold
+VPS reboot) resumed exactly where the process left off, with no lost
+positions or duplicated trades. The risk pipeline's gates (confidence,
+oracle ambiguity, extremes, sizing, depth/slippage) all fired as designed
+and never let a candidate through that they were supposed to block. When a
+state-tracking bug did surface (11 paper-ghost positions accumulating
+against 4 real on-chain ones), it was caught, diagnosed, and reconciled
+without live funds ever being at risk from it.
+
 ### What didn't, and why
 
+The core forecasting thesis was wrong in the way that matters most: the
+model's probability estimate, used as `edge = ourProbability - price`,
+treated a large disagreement with a liquid market's price as opportunity.
+The data says the opposite was almost always true: a large divergence from
+the market was far more often the model being wrong than the model seeing
+something the market hadn't priced in yet. Nothing in the original pipeline
+tested that assumption against real resolutions before sizing capital on
+it; `edge` was computed and acted on as if the model's raw probability
+deserved the same trust as the market price it was being compared against.
+It didn't, and the sizing math (fractional Kelly, scaled by that edge)
+turned a bad estimate into a bad-sized bet.
+
+On 2026-08-17, a fix shipped: `MARKET_SHRINK_LAMBDA` shrinks the model's
+probability toward the market price before edge or sizing is computed at
+all (default 0.5, halfway), and `MAX_RAW_EDGE` refuses to trade at all past
+a raw pre-shrink divergence of 0.25, the exact threshold the calibration
+data showed was uniformly a loser. That fix ran for the final days of the
+competition; there wasn't enough post-fix trading volume to say with
+confidence how much it would have changed the final result had it shipped
+on day one, only that it was addressing a real, measured failure mode
+rather than a guessed one.
+
 ### What we'd do differently
+
+Treat "our estimate beats the market" as a hypothesis to validate cheaply
+against real resolutions before it is ever allowed to size a live trade,
+not as a standing assumption baked into how edge is computed from day one.
+Concretely: run the calibration analysis this repo now has continuously
+from the start, not as a post-mortem, comparing forecast probabilities to
+resolutions as they come in, and gating how much weight a forecast is
+allowed in sizing on its own recent track record rather than its
+self-reported confidence. The market-shrink and raw-edge-cutoff fix is the
+right shape of correction; the mistake was building the system for a
+competition-length live run before that correction, or anything like it,
+existed.
 
 ## Setup
 
@@ -168,7 +248,7 @@ Fill in `.env`:
 
 ```bash
 npx tsc --noEmit     # typecheck
-npm test              # 116 tests, should all pass
+npm test              # 136 tests, should all pass
 ```
 
 ## Running in PAPER
